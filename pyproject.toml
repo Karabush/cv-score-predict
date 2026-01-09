@@ -1,28 +1,22 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=70.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cv-score-predict"
-version = "0.1.1"
+version = "0.1.2"
 description = "Cross-validated ensemble prediction with LGBM, XGBoost, and CatBoost — with safe categorical handling, multi-seed averaging, and artifact return."
 readme = "README.md"
-license = {text = "MIT"}
+requires-python = ">=3.9"
+license = { text = "MIT" }
 authors = [
-    {name = "Danu ANDRIES", email = "danu@andries.lu"},
+    { name = "Danu ANDRIES", email = "danu@andries.lu" },
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3", 
+    "Intended Audience :: Developers", 
+    "Intended Audience :: Science/Research", 
+    "Topic :: Scientific/Engineering :: Artificial Intelligence", 
 ]
 dependencies = [
     "numpy>=1.21",
@@ -32,7 +26,6 @@ dependencies = [
     "xgboost>=1.7",
     "catboost>=1.2"
 ]
-requires-python = ">=3.8"
 
 keywords = [
     "cross-validation",
@@ -59,6 +52,9 @@ keywords = [
     "data leakage prevention",
     "boosting ensemble"
 ]
+[tool.setuptools.packages.find]
+exclude = ["tests*", "notebooks*", "temp*", "scripts*", "*catboost*"]
+
 [project.urls]
 Homepage = "https://github.com/Karabush/cv-score-predict"
 Repository = "https://github.com/Karabush/cv-score-predict"

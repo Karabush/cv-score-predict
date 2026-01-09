@@ -1,6 +1,7 @@
 # cv-score-predict
 
-A robust utility for **cross-validated ensemble prediction** with LightGBM, XGBoost and CatBoost. Handles categorical features safely, supports custom preprocessing pipelines, repeated CV over multiple seeds, early stopping, and returns out-of-fold (OOF) predictions, test predictions, trained models, and fitted encoder — all in one call.
+A robust utility for **cross-validated ensemble prediction** that performs per‑fold early stopping and uses the early‑stopped models themselves for prediction.
+Each fold trains LightGBM, XGBoost, or CatBoost with early stopping on its validation split; the resulting early‑stopped estimators generate both OOF predictions and averaged test predictions. The function also supports custom preprocessing pipelines, safe categorical encoding, repeated CV over multiple seeds, and optional return of trained models and the fitted encoder.
 
 Designed for **kagglers, ML engineers, and data scientists** who need reliable, leakage-free CV with minimal boilerplate.
 
@@ -49,7 +50,7 @@ pip install cv-score-predict
 Requirements:
 
 * Python ≥ 3.8
-* Dependencies (automatically installed):
+* Dependencies:
 numpy, pandas, scikit-learn ≥1.4, lightgbm, xgboost, catboost
 
 ---
