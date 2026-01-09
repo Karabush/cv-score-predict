@@ -15,7 +15,7 @@ def test_classification_full_pipeline():
     processor = ColumnTransformer([
         ("num", StandardScaler(), ["num"]),
         ("cat", "passthrough", ["cat"])
-    ])
+    ]).set_output(transform="pandas")
 
     oof, test_pred, trained, oe = cv_score_predict(
         X=X,
