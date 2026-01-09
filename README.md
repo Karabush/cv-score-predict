@@ -9,12 +9,13 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 
 ## ✨ Key Features
 
-- **Multi-model ensembling**: Train and average predictions from LGBM, XGBoost and CatBoost in a single CV run.
-- **Native categorical support**: Automatically encodes string/categorical columns with `OrdinalEncoder` and configures models (e.g., `cat_features` for CatBoost, `enable_categorical` for XGBoost).
-- **Safe preprocessing**: Integrates any scikit-learn-compatible `processor` pipeline (e.g., `ColumnTransformer`, `Pipeline`) — fitted **per fold** to prevent data leakage.
-- **Repeated CV**: Average results over multiple random seeds for stable metrics.
-- **Early stopping**: Enabled by default for all models using fold-wise validation.
-- **Full artifact return**: Get OOF predictions, test predictions, trained models, and fitted `OrdinalEncoder` for later use.
+- **Per‑fold early stopping**: Each fold trains with early stopping on its validation split and uses the early‑stopped estimator for OOF and test predictions.
+- **Multi-model ensembling**: Train and average predictions from LightGBM, XGBoost, and CatBoost within each fold and then average across folds and seeds.
+- **Safe preprocessing**: Accepts any processor with fit_transform and transform that returns a pd.DataFrame; the processor is fitted on each fold’s training data to avoid leakage.
+- **Native categorical support**: Automatically encodes object/category columns with OrdinalEncoder(dtype=np.int32) using -1 for missing/unseen values, converts them to pandas category dtype, and sets model flags (cat_features for CatBoost, enable_categorical for XGBoost).
+- **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed and results are averaged for stability.
+- **Flexible scoring and thresholding**: Custom scoring_dict supported; defaults to ROC AUC for classification and RMSE for regression. For classification you can return probabilities or binary labels via predict_proba and decision_threshold.
+- **Artifact return**: Optionally return the list of trained model instances and the fitted OrdinalEncoder so you can reproduce encoding and make predictions on new data.
 
 ---
 
@@ -61,6 +62,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import make_column_transformer
+from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
 from cv_score_predict import cv_score_predict
 
 # Simulate data
@@ -71,12 +73,6 @@ X = pd.DataFrame({
 y = [0, 1, 0, 1, 1, 0, 1, 0]
 X_test = pd.DataFrame({"num": [9, 10], "cat": ["B", "E"]})
 
-# Optional processor (applied per fold!)
-processor = make_column_transformer(
-    (StandardScaler(), ["num"]),
-    remainder="passthrough"
-)
-
 # Run CV with 3 seeds → results averaged over seeds & folds
 oof_pred, test_pred, _, _ = cv_score_predict(
     X=X,
@@ -84,8 +80,8 @@ oof_pred, test_pred, _, _ = cv_score_predict(
     X_test=X_test,
     pred_type="classification",
     processor=processor,
-    models=["lgb", "xgb"],
     process_categorical=True,
+    models=["lgb", "xgb"],
     random_state=[42, 123, 999],
     n_splits=3,
     verbose=2,
@@ -98,36 +94,50 @@ Output will show scores per seed, then final averaged metrics.
 
 ## 🔧 Advanced Usage: Reuse Artifacts for New Data
 ```python
-# Step 1: Run CV and return artifacts
+# Optional processor: ensure it returns a pandas DataFrame
+processor = make_column_transformer(
+    (StandardScaler(), ["num"]),
+    remainder="passthrough"
+).set_output(transform='pandas')
+
+# Optional metrics dictionary 
+scoring_dict = { 
+    "roc_auc": roc_auc_score,   # expects probabilities 
+    "accuracy": accuracy_score, # expects labels (we convert internally for threshold-based metrics) 
+    "log_loss": log_loss,       # expects probabilities 
+    }
+# Optional custom models' parameters
+params_dict = {
+    "lgb": {"learning_rate": 0.1, "num_leaves": 100}, 
+    "xgb": {"learning_rate": 0.1, "max_depth": 10}, 
+    "cb": {"learning_rate": 0.1, "depth": 8}, 
+    }
+# Run CV and return artifacts
 oof, _, trained_models, oe = cv_score_predict(
     X,
     y,
     X_test=None,  # we'll predict manually
     pred_type="classification",
     processor=processor,
-    models=["lgb", "cb"],
     process_categorical=True,
+    models=["lgb", "xgb", "cb"],
+    params_dict = params_dict,
+    scoring_dict=scoring_dict,
     random_state=[42, 123],
     n_splits=5,
     return_trained=True,
     return_oe=True,
 )
-
-# Step 2: For deployment: refit processor on FULL TRAINING data
-# First: encode categoricals using returned oe
+# Encode categoricals using returned oe
 cat_cols = ["cat"]
 X_full = X.copy()
 X_full[cat_cols] = oe.transform(X_full[cat_cols]).astype('category')
-X_new = pd.DataFrame({"num": [7, 8], "cat": [None, "A"]})
 
-# Fit processor on full encoded data
-processor = make_column_transformer(
-    (StandardScaler(), ["num"]),
-    remainder="passthrough"
-)
+# Fit the processor on the encoded full training set
 processor.fit(X_full)
 
 # Apply to new data
+X_new = pd.DataFrame({"num": [7, 8], "cat": [None, "A"]})
 X_new_proc = X_new.copy()
 X_new_proc[cat_cols] = oe.transform(X_new_proc[cat_cols]).astype('category')
 X_new_proc = processor.transform(X_new_proc)
