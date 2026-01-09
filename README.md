@@ -46,13 +46,18 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 pip install cv-score-predict
 ```
 
-Requires: Python ≥3.8, scikit-learn ≥1.4
+Requirements:
+
+* Python ≥ 3.8
+* Dependencies (automatically installed):
+numpy, pandas, scikit-learn ≥1.4, lightgbm, xgboost, catboost
 
 ---
 
 ## 📌 Basic Usage
 ```python
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import make_column_transformer
 from cv_score_predict import cv_score_predict
@@ -124,7 +129,7 @@ processor.fit(X_full)
 # Apply to new data
 X_new_proc = X_new.copy()
 X_new_proc[cat_cols] = oe.transform(X_new_proc[cat_cols]).astype('category')
-X_new_proc = processor_full.transform(X_new_proc)
+X_new_proc = processor.transform(X_new_proc)
 
 # Predict with all trained models and average
 preds = [model.predict_proba(X_new_proc)[:, 1] for model in trained_models]
@@ -133,15 +138,7 @@ final_pred = np.mean(preds, axis=0)
 ## 📝 Notes
 Categorical columns are encoded with OrdinalEncoder(dtype=np.int32) and converted to category dtype for model compatibility.
 Always use set_output(transform="pandas") in sklearn pipelines to preserve dtypes.
-For production deployment, refit preprocessing on full data (CV uses per-fold fitting).
-
-## 🔑 Keywords
-cross-validation, ensemble learning, model averaging, LightGBM, XGBoost, CatBoost,  
-categorical encoding, OrdinalEncoder, out-of-fold prediction, OOF,  
-multi-seed CV, repeated cross-validation, early stopping,  
-scikit-learn compatible, pandas, machine learning,  
-classification, regression, model validation, kaggle,  
-safe preprocessing, data leakage prevention, boosting ensemble
+The processor used in CV is refit on each fold to prevent data leakage, so there is no single global version. For deployment, refit your preprocessing pipeline on the full training set (as shown in the advanced example).
 
 ## 📄 License
 This project is licensed under the MIT License.
