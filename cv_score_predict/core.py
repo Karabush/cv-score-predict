@@ -238,6 +238,7 @@ def cv_score_predict(
         for fold, (train_idx, val_idx) in enumerate(splitter.split(X, y)):
             _print(f'\nFold {fold + 1}/{n_splits}', level=2)
 
+            y = y if isinstance(y, pd.Series) else pd.Series(y)
             X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
