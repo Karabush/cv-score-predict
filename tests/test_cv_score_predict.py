@@ -39,5 +39,5 @@ def test_classification_full_pipeline():
     assert fitted_processor is not None
 
     # Check that unseen category 'V' was encoded as -1
-    X_enc = fitted_processor.transform(X_test[["cat"]])
-    assert X_enc.iloc[1, 0] == -1  # 'V' → -1
+    X_enc = fitted_processor.transform(X_test)
+    assert X_enc[["cat"]].iloc[1, 0] == -1  # 'V' → -1
