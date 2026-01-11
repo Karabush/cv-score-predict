@@ -17,7 +17,7 @@ def test_classification_full_pipeline():
         ("cat", "passthrough", ["cat"])
     ]).set_output(transform="pandas")
 
-    oof, test_pred, trained, oe = cv_score_predict(
+    oof, test_pred, trained_models, fitted_processor = cv_score_predict(
         X=X,
         y=y,
         X_test=X_test,
@@ -28,7 +28,6 @@ def test_classification_full_pipeline():
         random_state=[42, 99],
         n_splits=2,
         return_trained=True,
-        return_oe=True,
         verbose=0
     )
 
@@ -36,9 +35,9 @@ def test_classification_full_pipeline():
     assert len(oof) == len(X)
     assert len(test_pred) == len(X_test)
     assert test_pred.min() >= 0 and test_pred.max() <= 1  # probabilities
-    assert len(trained) == 2 * 2 * 2  # 2 models × 2 folds × 2 seeds
-    assert oe is not None
+    assert len(trained_models) == 2 * 2 * 2  # 2 models × 2 folds × 2 seeds
+    assert fitted_processor is not None
 
     # Check that unseen category 'V' was encoded as -1
-    X_enc = oe.transform(X_test[["cat"]])
+    X_enc = fitted_processor.transform(X_test[["cat"]])
     assert X_enc.iloc[1, 0] == -1  # 'V' → -1

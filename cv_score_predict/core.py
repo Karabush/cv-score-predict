@@ -12,7 +12,6 @@ from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.pipeline import make_pipeline
 
 class _CatWrapper(BaseEstimator, TransformerMixin):
     """
@@ -45,7 +44,8 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
                 dtype=np.int32,
                 handle_unknown='use_encoded_value',
                 unknown_value=-1,
-                encoded_missing_value=-1
+                encoded_missing_value=-1,
+                min_frequency=0.01,
             ).set_output(transform='pandas')
             self.oe_.fit(X_proc[self.cat_cols_])
         else:
