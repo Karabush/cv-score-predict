@@ -12,11 +12,12 @@ def test_classification_full_pipeline():
     y = [0, 1, 0, 1, 1, 0, 1, 0]
     X_test = pd.DataFrame({"num": [9.1, 10.2], "cat": ["Y", "V"]})  # V is unseen
 
-    processor = ColumnTransformer([
-        ("num", StandardScaler(), ["num"]),
-        ("cat", "passthrough", ["cat"])
-    ]).set_output(transform="pandas")
-
+    processor = ColumnTransformer(
+        [("num_", StandardScaler(), ["num"])],
+        remainder="passthrough",
+        verbose_feature_names_out=False,
+        ).set_output(transform="pandas")
+    
     oof, test_pred, trained_models, fitted_processor = cv_score_predict(
         X=X,
         y=y,
