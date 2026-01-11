@@ -1,5 +1,5 @@
 from typing import (
-    Union, List, Dict, Tuple, Optional, Callable, Any, Literal, TypeVar
+    Union, List, Dict, Tuple, Optional, Callable, Any, Literal,
 )
 import numpy as np 
 import pandas as pd 
@@ -7,10 +7,73 @@ import lightgbm as lgb
 import xgboost as xgb 
 import catboost as cb 
 
+from copy import deepcopy
 from sklearn.model_selection import StratifiedKFold, KFold 
 from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import make_pipeline
+
+class _CatWrapper(BaseEstimator, TransformerMixin):
+    """
+    Applies base_processor, then OrdinalEncodes any object/category columns in its output.
+    """
+    def __init__(self, base_processor):
+        self.base_processor = base_processor
+
+    def fit(self, X, y=None):
+        X_proc = self.base_processor.fit_transform(X, y)
+
+        # If base_processor doesn't return a DataFrame, we won't attempt to detect or encode categories.
+        if not isinstance(X_proc, pd.DataFrame):
+            self._returns_df = False
+            self.cat_cols_ = []
+            self.oe_ = None
+
+            return self
+
+        self._returns_df = True
+
+        # Collect categorical/object columns (avoid select_dtypes to reduce intermediate objects)
+        self.cat_cols_ = []
+        for col, dtype in X_proc.dtypes.items():
+            if pd.api.types.is_object_dtype(dtype) or isinstance(dtype, pd.CategoricalDtype):
+                self.cat_cols_.append(col)
+
+        if self.cat_cols_:
+            self.oe_ = OrdinalEncoder(
+                dtype=np.int32,
+                handle_unknown='use_encoded_value',
+                unknown_value=-1,
+                encoded_missing_value=-1
+            ).set_output(transform='pandas')
+            self.oe_.fit(X_proc[self.cat_cols_])
+        else:
+            self.oe_ = None
+
+        return self
+
+    def transform(self, X):
+        X_proc = self.base_processor.transform(X)
+
+        # If processor returned non-DataFrame at fit time, or if no categorical columns 
+        # were detected at fit time - we do not attempt to encode anything and just return 
+        # the processor output unchanged.
+        if not isinstance(X_proc, pd.DataFrame) or not self.cat_cols_:
+            return X_proc
+
+        # Encode categorical and convert to pandas categorical dtype
+        X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
+
+        return X_proc
+
+class _IdentityProcessor(BaseEstimator, TransformerMixin):
+    """Processor fallback (identity)"""
+    def fit(self, X, y=None):
+        return self
+    
+    def transform(self, X):
+        return X.copy()
 
 # Type aliases 
 ModelKey = Literal['lgb', 'xgb', 'cb']
@@ -32,9 +95,8 @@ def cv_score_predict(
     early_stopping_rounds: int = 50,
     verbose: int = 2,
     return_trained: bool = False,
-    return_oe: bool = False,
     predict_proba: bool = True,
-) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[List[Any]], Optional[OrdinalEncoder]]:
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[List[Any]], Optional[Any]]:
     """
     Cross-validate supported estimators (optionally repeated over multiple seeds),
     collect out‑of‑fold (OOF) predictions for scoring, and produce averaged
@@ -43,13 +105,10 @@ def cv_score_predict(
 
     Important behavior
     ------------------
-    - Early stopping: estimators are trained with early stopping on each fold's
-      validation set. Final test predictions (when `X_test` is provided) are
-      produced by the early‑stopped estimators from each fold and averaged.
-    - Processor contract: if a `processor` is provided it **must** return a
-      pandas DataFrame from `.fit_transform` and `.transform`. To guarantee
-      this, call `pipeline.set_output(transform='pandas')`. This preserves
-      column names and dtypes (including `category`) required by some models.
+    Estimators are trained with early stopping on each fold's validation set. 
+    If custom model parameters are provided, number of iterations should be reasonable high
+    to allow space for early stopping. Final test predictions (when `X_test` is provided) 
+    are produced by the early‑stopped estimators from each fold and averaged.
 
     Parameters
     ----------
@@ -63,7 +122,6 @@ def cv_score_predict(
         Either 'classification' or 'regression'.
     processor : object or None, optional
         Preprocessing pipeline with `fit_transform` and `transform` methods.
-        Must return a pandas DataFrame.
     process_categorical : bool, default True
         If True, object/category columns are encoded using an OrdinalEncoder
         fitted on the training DataFrame only (no leakage), then converted to
@@ -73,8 +131,8 @@ def cv_score_predict(
     models : list or str, default ('lgb', 'xgb', 'cb')
         Model keys to train. Supported values: 'lgb', 'xgb', 'cb'.
     params_dict : dict or None, optional
-        Mapping `model_name -> dict` of model parameters. If None, sensible
-        defaults are used. Per‑model entries override top‑level defaults.
+        Mapping `model_name -> dict` of model parameters. 
+        If None, n_estimators=10000 is used to allow space for early stopping.
     scoring_dict : dict or None, optional
         Mapping `metric_name -> callable(y_true, y_pred_or_proba)`. If None,
         defaults are provided (classification: ROC AUC; regression: RMSE).
@@ -92,13 +150,9 @@ def cv_score_predict(
         0 prints nothing.
     return_trained : bool, default False
         If True, return the list of trained estimator instances (one per model
-        per fold per seed). If False (default), trained estimators are not
-        accumulated and `None` is returned in that position to save memory.
-    return_oe : bool, default False
-        If True, return the fitted `OrdinalEncoder` instance (or None if no
-        categorical processing was performed). Returning `oe` lets the user
-        reproduce categorical encoding on new raw data; the user must still
-        apply the same `processor` (if used) before applying `oe` and predicting.
+        per fold per seed) and the final fitted preprocessing pipeline. 
+        If False (default), trained estimators are not accumulated and the final 
+        preprocessing pipeline is not fitted and None is returned in that positions.
     predict_proba : bool, default True
         For classification: if True return probabilities; if False return binary
         labels using `decision_threshold`. Ignored for regression.
@@ -115,9 +169,9 @@ def cv_score_predict(
     trained_models_or_none : list or None
         If `return_trained=True`, the list of trained model instances (order preserved).
         Otherwise None.
-    oe_or_none : OrdinalEncoder or None
-        The fitted `OrdinalEncoder` if `return_oe=True` and categorical processing
-        was performed; otherwise None.
+    final_processor_or_none : Pipeline or None
+        Final fitted preprocessing pipeline (processor + OrdinalEncoder if used), fitted on full X, 
+        returned only if return_trained=True. Otherwise None.
     """
     # Input Validation
     if pred_type not in ('classification', 'regression'):
@@ -144,6 +198,9 @@ def cv_score_predict(
     if len(X) != len(y):
         raise ValueError("`X` and `y` must have the same number of samples.")
     
+    # Ensure y as pd.Series for consistent indexing with iloc
+    y = y if isinstance(y, pd.Series) else pd.Series(y)
+
     # Default scoring
     if scoring_dict is None:
         if pred_type == 'classification':
@@ -158,62 +215,25 @@ def cv_score_predict(
         for m in models:
             params_dict.setdefault(m, {})
 
-    # Processor fallback (identity)
-    class _IdentityProcessor:
-        def fit_transform(self, X, y=None): return X
-        def transform(self, X): return X
-
     if processor is None:
-        processor = _IdentityProcessor()
-
+        base_processor = _IdentityProcessor()
     elif not hasattr(processor, 'fit_transform') or not hasattr(processor, 'transform'):
         raise TypeError("`processor` must have `fit_transform` and `transform` methods.")
-    
-    # Defensive Copies
-    X = X.copy().reset_index(drop=True)
-    y = pd.Series(y).copy().reset_index(drop=True) if isinstance(y, (pd.Series, np.ndarray)) else np.asarray(y)
-    if X_test is not None:
-        X_test = X_test.copy().reset_index(drop=True)
+    else:
+        base_processor = processor
 
-    # Categorical handling
-    cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
-    ordinal_encoder: Optional[OrdinalEncoder] = None
-    
-    if cat_cols and process_categorical:
-        oe = OrdinalEncoder(
-        dtype=np.int32,
-        handle_unknown='use_encoded_value',
-        unknown_value=-1,
-        encoded_missing_value=-1,  
-        ).set_output(transform='pandas')
-
-        X[cat_cols] = oe.fit_transform(X[cat_cols]).astype('category')
-
-        if X_test is not None:
-            X_test[cat_cols] = oe.transform(X_test[cat_cols]).astype('category')
-
-        ordinal_encoder = oe
-
-        # Set model-specific categorical flags
-        for m in models:
-            if m == 'xgb':
-                params_dict['xgb']['enable_categorical'] = True
-            elif m == 'cb':
-                params_dict['cb']['cat_features'] = cat_cols
-    
     # Prepare result containers
     n_samples = len(X)
     test_n = len(X_test) if X_test is not None else 0
     
     oof_preds_total = np.zeros(n_samples, dtype=np.float64)
     test_preds_total = np.zeros(test_n, dtype=np.float64) if X_test is not None else None
-    trained_models_list: List[Any] = [] if return_trained else None
+    trained_models: List[Any] = [] if return_trained else None
 
     # CV results storage
     cv_results = {
         'stacked': {name: [] for name in scoring_dict.keys()},
         'per_model': {m: {name: [] for name in scoring_dict.keys()} for m in models},
-        'per_seed': [],
     }
     # Helper for controlled printing
     def _print(msg, level=2):
@@ -238,30 +258,49 @@ def cv_score_predict(
         for fold, (train_idx, val_idx) in enumerate(splitter.split(X, y)):
             _print(f'\nFold {fold + 1}/{n_splits}', level=2)
 
-            y = y if isinstance(y, pd.Series) else pd.Series(y)
             X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
+            # Choose preprocessor based on process_categorical
+            if process_categorical:
+                fold_base = deepcopy(base_processor)
+                fold_processor = _CatWrapper(fold_base)
+            else:
+                fold_processor = deepcopy(base_processor)
+
             # Apply processor if provided (fit on fold train only)
-            X_train = processor.fit_transform(X_train, y_train)
-            X_val = processor.transform(X_val)
-            X_test_proc = processor.transform(X_test) if X_test is not None else None
+            X_train = fold_processor.fit_transform(X_train, y_train)
+            X_val = fold_processor.transform(X_val)
+            X_test_proc = fold_processor.transform(X_test) if X_test is not None else None
             
-            # Ensure processor returns DataFrame (so categorical dtypes are preserved)
-            if not isinstance(X_train, pd.DataFrame):
-                raise TypeError("processor.fit_transform must return a pandas DataFrame. "
-                                "Use pipeline.set_output(transform='pandas').")
-            
+            # Get categorical columns for model params (only if using wrapper)
+            cat_cols = getattr(fold_processor, 'cat_cols_', [])
+
+            # Update model params for categorical handling
+            local_params_dict = {}
+            for m in models:
+                p = params_dict[m].copy()
+                if cat_cols and process_categorical:
+                    # lgb handles categories automatically via pandas categorical dtype
+                    if m == 'xgb':
+                        p['enable_categorical'] = True
+                    elif m == 'cb':
+                        p['cat_features'] = cat_cols
+                local_params_dict[m] = p
+
             fold_val_preds_list = []
             fold_test_preds_list = []
 
             for model_name in models:
-                p = params_dict.get(model_name, {}).copy()
+                p = local_params_dict[model_name]
 
                 # Train model
                 if model_name == 'lgb':
                     ModelClass = lgb.LGBMClassifier if pred_type == 'classification' else lgb.LGBMRegressor
-                    p.setdefault('n_estimators', 10000)
+                    # Set a high default to allow early stopping to determine optimal rounds
+                    if not p:
+                        p.setdefault('n_estimators', 10000)
+
                     p.setdefault('verbosity', -1)
                     model = ModelClass(**p)
                     model.fit(
@@ -274,17 +313,19 @@ def cv_score_predict(
                    
                     if model_name == 'xgb': 
                         ModelClass = xgb.XGBClassifier if pred_type == 'classification' else xgb.XGBRegressor
-                        p.setdefault('n_estimators', 10000) 
+                        if not p:
+                            p.setdefault('n_estimators', 10000) 
                     else:
                         ModelClass = cb.CatBoostClassifier if pred_type == 'classification' else cb.CatBoostRegressor
-                        p.setdefault('iterations', 10000)
+                        if not p:
+                            p.setdefault('iterations', 10000)
 
                     model = ModelClass(**p) 
                     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
                 # Append trained model instance only if requested
                 if return_trained:
-                    trained_models_list.append(model)
+                    trained_models.append(model)
 
                 # Predictions              
                 if pred_type == 'classification':
@@ -298,6 +339,7 @@ def cv_score_predict(
                     test_fold_preds = model.predict(X_test_proc) if X_test_proc is not None else None
 
                 fold_val_preds_list.append(val_preds)
+
                 if X_test is not None:
                     fold_test_preds_list.append(test_fold_preds)
 
@@ -362,17 +404,17 @@ def cv_score_predict(
         if X_test is not None:
             test_preds_total += test_preds / len(random_states)
         
-        # Print per-model means (seed)
-        _print(f'\nSeed {seed} mean scores:', level=2)
-        for model_name in models:
-            for metric_name, vals in seed_model_scores[model_name].items():
-                mean_val = float(np.mean(vals)) if vals else float('nan')
-                _print(f'  {model_name.upper()} {metric_name}: {mean_val:.5f}', level=2)
+        if verbose >= 2:
+            # Print per-model means (seed)
+            _print(f'\nSeed {seed} mean scores:', level=2)
+            for model_name in models:
+                for metric_name, vals in seed_model_scores[model_name].items():
+                    mean_val = float(np.mean(vals)) if vals else float('nan')
+                    _print(f'  {model_name.upper()} {metric_name}: {mean_val:.5f}', level=2)
 
-        # Print stacked mean scores (seed)
-        seed_mean_scores = {k: float(np.mean(v)) for k, v in seed_stack_scores.items()}
-        for metric_name, score in seed_mean_scores.items():
-            _print(f'  Stacked {metric_name}: {score:.5f}', level=2)
+            # Print stacked mean scores (seed)
+            for metric_name, score in {k: float(np.mean(v)) for k, v in seed_stack_scores.items()}.items():
+                _print(f'  Stacked {metric_name}: {score:.5f}', level=2)
 
     # Final summary print
     if verbose >= 1:
@@ -381,7 +423,6 @@ def cv_score_predict(
         print('Mean CV Scores per Model:')
         for model_name in models:
             print(f'\n--- {model_name.upper()} ---')
-
             for metric_name, scores in cv_results['per_model'][model_name].items():
                 print(f'  {metric_name}: {np.mean(scores):.5f}')
   
@@ -396,9 +437,19 @@ def cv_score_predict(
         if test_preds_total is not None:
             test_preds_total = (test_preds_total >= decision_threshold).astype(int)
     
+    # Final preprocessing pipeline fitted on full data
+    final_processor = None
+    if return_trained:
+        if process_categorical:
+            final_processor = _CatWrapper(base_processor)
+            final_processor.fit(X, y)
+        else:
+            final_processor = base_processor
+            final_processor.fit(X, y)
+
     # Prepare return values
     test_preds_return = test_preds_total if X_test is not None else None
-    trained_return = trained_models_list if return_trained else None
-    oe_return = ordinal_encoder if return_oe else None
+    trained_models = trained_models if return_trained else None
+    final_processor = final_processor if return_trained else None
 
-    return oof_preds_total, test_preds_return, trained_return, oe_return
+    return oof_preds_total, test_preds_return, trained_models, final_processor
