@@ -1,7 +1,7 @@
 # cv-score-predict
 
-A robust utility for **cross-validated ensemble prediction** that performs per‑fold early stopping and uses the early‑stopped models themselves for prediction.
-Each fold trains LightGBM, XGBoost, or CatBoost with early stopping on its validation split; the resulting estimators generate both out-of-fold (OOF) predictions and averaged test predictions. The function supports custom preprocessing pipelines, dynamic per-fold categorical encoding, repeated CV over multiple seeds, and optional return of trained models and a final preprocessing pipeline fitted on the full dataset.
+A robust utility for **cross-validated ensemble prediction** that performs per‑fold early stopping and exposes raw model outputs for advanced stacking, diagnostics, or custom ensembling.
+Each fold trains LightGBM, XGBoost, or CatBoost with early stopping on its validation split; the resulting estimators generate raw out-of-fold (OOF) and test predictions from every model, fold, and seed. The function supports custom preprocessing pipelines, dynamic per-fold categorical encoding, repeated CV over multiple seeds, and when requested — returns trained models along with their corresponding fold-specific preprocessors.
 
 Designed for **kagglers, ML engineers, and data scientists** who need reliable, leakage-free CV with minimal boilerplate.
 
@@ -10,14 +10,30 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 ## ✨ Key Features
 
 - **Per‑fold early stopping**: Each fold trains with early stopping on its validation split and uses the early‑stopped estimator for OOF and test predictions.
-- **Multi-model ensembling**: Train and average predictions from LightGBM, XGBoost, and CatBoost within each fold and then average across folds and seeds.
-- **Safe preprocessing**: Accepts any processor with fit_transform and transform that returns a pd.DataFrame. The processor is fitted per fold to avoid leakage.
-- **Dynamic categorical handling**: When process_categorical=True, the function automatically detects object/category columns after the base processor runs, encodes them per fold using OrdinalEncoder(dtype=np.int32) with -1 for missing/unseen values, and converts them to pandas 'category' dtype. Model-specific flags (enable_categorical for XGBoost, cat_features for CatBoost) are set automatically.
-- **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed and results are averaged for stability.
-- **Flexible scoring and thresholding**: Custom scoring_dict supported; defaults to ROC AUC for classification and RMSE for regression. For classification you can return probabilities or binary labels via predict_proba and decision_threshold.
-- **Artifact return**: When return_trained=True, returns:
-    - A list of all trained model instances (one per model × fold × seed),
-    - A final preprocessing pipeline (base processor + categorical encoder if used), fitted on the full training set, ready for inference on new data.
+- **Raw prediction matrices**: Returns two DataFrames:
+    - `oof_preds_df`: raw OOF predictions — one column per (model, seed). Predictions from all folds for a given (model, seed) are stitched together into a single column.
+    - `test_preds_df`: raw test predictions — one column per (model, seed, fold), i.e., one prediction per fitted model.
+    - → Perfect for averaging, stacking, model blending, or error analysis.
+- **Multi-model support**: Train LightGBM (`'lgb'`), XGBoost (`'xgb'`), and CatBoost (`'cb'`) in the same CV loop.
+- **Safe fold-wise preprocessing**: Accepts any scikit-learn–compatible processor with `fit_transform`/`transform`. Fitted independently per fold to prevent data leakage.
+- **Dynamic categorical handling**: When `process_categorical=True`, the function:
+    - Detects object/category columns after the base processor runs,
+    - Fits an `OrdinalEncoder` per fold (using `-1` for missing/unseen categories),
+    - Converts encoded columns to pandas `'category'` dtype so boosting libraries auto-detect them,
+    - Automatically sets model-specific flags: `enable_categorical=True` for XGBoost, `cat_features=col_names` for CatBoost. LightGBM requires no extra flag thanks to pandas categorical dtype.
+- **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed, and all raw predictions are preserved.
+- **Flexible scoring and thresholding**: 
+    - Custom `scoring_dict` supported (e.g., accuracy, log loss, RMSE).
+    - Defaults: ROC AUC for classification, RMSE for regression.
+    - For classification, return probabilities (`predict_proba=True`) or binary labels (`predict_proba=False`)  using `decision_threshold.
+- **Artifact return**: When `return_trained=True`, returns a list of tuples (`fold_processor, model`) — one per model × fold × seed — where `fold_processor` is the preprocessor fitted on that fold’s training data,
+- **Transparent, diagnostic-rich logging**: 
+    With `verbose=2` (default), the function prints:
+    - Per-fold scores for every model,
+    - Stacked (mean of model predictions) score per fold,
+    - Per-seed mean scores (by model and stacked),
+    - Final cross-seed summary of mean CV performance.
+    - → Enables instant diagnosis of model instability, fold bias, or seed sensitivity — no extra code needed.
 
 ---
 
@@ -39,7 +55,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `random_state` | `Union[int, List[int]]` | `42` | Seed(s) for reproducibility. If a list, CV is repeated for each seed and results are averaged. |
 | `early_stopping_rounds` | `int` | `50` | Early stopping rounds for boosting models (if not overridden in `params_dict`). |
 | `verbose` | `int` | `2` | Logging level: `2` = full per-fold details, `1` = final summary, `0` = silent. |
-| `return_trained` | `bool` | `False` | If True, returns:<br>• List of trained model instances,<br>• Final preprocessing pipeline (base processor + categorical encoder) fitted on full X. |
+| `return_trained` | `bool` | `False` | If True, returns a list of (fold_processor, model) tuples (one per model × fold × seed). |
 | `predict_proba` | `bool` | `True` | For classification: if `True`, return probabilities; if `False`, return binary labels (using `decision_threshold`). Ignored for regression. |
 ---
 
@@ -53,13 +69,13 @@ Requirements:
 
 * Python ≥ 3.8
 * Dependencies:
-numpy, pandas, scikit-learn ≥1.4, lightgbm, xgboost, catboost
+`numpy`, `pandas`, `scikit-learn ≥1.4`, `lightgbm`, `xgboost`, `catboost`
 
 ---
 
 ## 📌 Basic Usage
 ```python
-import pandas as pd
+iimport pandas as pd
 from cv_score_predict import cv_score_predict
 
 # Simulate data
@@ -70,21 +86,30 @@ X = pd.DataFrame({
 y = [0, 1, 0, 1, 1, 0, 1, 0]
 X_test = pd.DataFrame({"num": [9, 10], "cat": ["B", "E"]})
 
-# Run CV with 3 seeds → results averaged over seeds & folds
-oof_pred, test_pred, _, _ = cv_score_predict(
+# Run CV with 2 seeds → get raw prediction matrices
+oof_preds_df, test_preds_df, _ = cv_score_predict(
     X=X,
     y=y,
     X_test=X_test,
     pred_type="classification",
     process_categorical=True,
     models=["lgb", "xgb"],
-    random_state=[42, 123, 999],
-    n_splits=3,
+    random_state=[42, 123],
+    n_splits=2,
     verbose=2,
 )
+
+# Analyze OOF predictions
+print("OOF predictions shape:", oof_preds_df.shape)   # e.g., (8, 4) → 2 models × 2 seeds
+print("Test predictions shape:", test_preds_df.shape) # e.g., (2, 8) → 2 models × 2 seeds × 2 folds
+print(oof_preds_df.columns.tolist())
+# ['lgb_seed_42', 'xgb_seed_42', 'lgb_seed_123', 'xgb_seed_123']
+
+# Average across all models/seeds for a final OOF prediction
+final_oof = oof_preds_df.mean(axis=1)
 ```
 
-Output will show scores per seed, then final averaged metrics.
+💡 Note: OOF predictions are already stitched across folds per (model, seed), so each OOF column is complete. Test predictions remain per-fold to preserve variance estimation.
 
 ---
 
@@ -96,7 +121,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
 from cv_score_predict import cv_score_predict
 
 # Define a processor that returns a DataFrame
-processor = make_column_transformer(
+base_processor = make_column_transformer(
     (StandardScaler(), ["num"]),
     remainder="passthrough"
 ).set_output(transform='pandas')
@@ -106,20 +131,17 @@ scoring_dict = {
     "accuracy": accuracy_score,
     "log_loss": log_loss,
 }
-
 params_dict = {
     "lgb": {"learning_rate": 0.1, "num_leaves": 100},
     "xgb": {"learning_rate": 0.1, "max_depth": 10},
     "cb": {"learning_rate": 0.1, "depth": 8},
 }
-
 # Run CV and return artifacts
-oof, _, trained_models, final_pipeline = cv_score_predict(
-    X,
-    y,
+oof_preds_df, _, trained_pipelines = cv_score_predict(
+    X, y,
     X_test=None,
     pred_type="classification",
-    processor=processor,
+    processor=base_processor,
     process_categorical=True,
     models=["lgb", "xgb", "cb"],
     params_dict=params_dict,
@@ -128,23 +150,29 @@ oof, _, trained_models, final_pipeline = cv_score_predict(
     n_splits=5,
     return_trained=True,
 )
-
-# Use final_pipeline to preprocess new data
+# Create new data
 X_new = pd.DataFrame({"num": [7, 8], "cat": [None, "A"]})
-X_new_processed = final_pipeline.transform(X_new)
 
-# Predict with all trained models and average
-preds = [model.predict_proba(X_new_processed)[:, 1] for model in trained_models]
-final_pred = np.mean(preds, axis=0)
+# Transform and predict using each trained pipeline
+all_new_preds = []
+for fold_processor, model in trained_pipelines:
+    X_new_proc = fold_processor.transform(X_new)
+    pred = model.predict_proba(X_new_proc)[:, 1]
+    all_new_preds.append(pred)
+
+# Ensemble by averaging
+final_new_pred = np.mean(all_new_preds, axis=0)
 ```
-✅ The final_pipeline includes your custom processor and the dynamic categorical encoder, fitted on the full training set, ensuring consistent preprocessing for deployment.
+This gives you a leakage-free stacking pipeline with proper early stopping and categorical handling.
 
 ---
 
 ## 📝 Notes
-* Categorical columns are detected after the base processor runs — so even if your processor creates, renames, or changes dtypes of columns, encoding works correctly.
-* Always use .set_output(transform="pandas") in sklearn pipelines to preserve column names and dtypes.
-* The per-fold pipeline ensures no data leakage; the final pipeline enables reproducible inference.
+* Column naming: 
+    - OOF: `{model}_seed_{seed}`
+    - Test: `{model}_seed_{seed}_fold_{fold}`
+* Always use `.set_output(transform="pandas")` in sklearn pipelines to preserve column names and dtypes.
+* Categorical detection happens after your base processor runs—so even if your pipeline creates or modifies categorical columns, they’ll be handled correctly when `process_categorical=True`.
 
 ---
 
