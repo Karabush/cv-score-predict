@@ -430,11 +430,12 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
         self._returns_df = True
 
         # Collect categorical/object columns (avoid select_dtypes to reduce intermediate objects)
-        self.cat_cols_ = []
-        for col, dtype in X_proc.dtypes.items():
-            if pd.api.types.is_object_dtype(dtype) or isinstance(dtype, pd.CategoricalDtype):
-                self.cat_cols_.append(col)
-
+        self.cat_cols_ = [
+            col for col, dtype in X_proc.dtypes.items() 
+            if pd.api.types.is_object_dtype(dtype) 
+            or pd.api.types.is_string_dtype(dtype) 
+            or isinstance(dtype, pd.CategoricalDtype)
+            ]
         if self.cat_cols_:
             self.oe_ = OrdinalEncoder(
                 dtype=np.int32,
@@ -458,23 +459,7 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
             return X_proc
 
         # Encode categorical and convert to pandas categorical dtype
-        if self.cat_cols_:
-            encoded = self.oe_.transform(X_proc[self.cat_cols_])
-            if isinstance(encoded, pd.DataFrame):
-                for col in self.cat_cols_:
-                    # Force fresh Series creation to bypass pandas CoW/view issues
-                    X_proc[col] = pd.Series(
-                        encoded[col].values,
-                        index=X_proc.index,
-                        dtype='category'
-                    )
-            else:  # numpy array
-                for i, col in enumerate(self.cat_cols_):
-                    X_proc[col] = pd.Series(
-                        encoded[:, i],
-                        index=X_proc.index,
-                        dtype='category'
-                    )
+        X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
 
         return X_proc
 
