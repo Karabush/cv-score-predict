@@ -12,68 +12,6 @@ from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.base import BaseEstimator, TransformerMixin
-
-class _CatWrapper(BaseEstimator, TransformerMixin):
-    """
-    Applies base_processor, then OrdinalEncodes any object/category columns in its output.
-    """
-    def __init__(self, base_processor):
-        self.base_processor = base_processor
-
-    def fit(self, X, y=None):
-        X_proc = self.base_processor.fit_transform(X, y)
-
-        # If base_processor doesn't return a DataFrame, we won't attempt to detect or encode categories.
-        if not isinstance(X_proc, pd.DataFrame):
-            self._returns_df = False
-            self.cat_cols_ = []
-            self.oe_ = None
-
-            return self
-
-        self._returns_df = True
-
-        # Collect categorical/object columns (avoid select_dtypes to reduce intermediate objects)
-        self.cat_cols_ = []
-        for col, dtype in X_proc.dtypes.items():
-            if pd.api.types.is_object_dtype(dtype) or isinstance(dtype, pd.CategoricalDtype):
-                self.cat_cols_.append(col)
-
-        if self.cat_cols_:
-            self.oe_ = OrdinalEncoder(
-                dtype=np.int32,
-                handle_unknown='use_encoded_value',
-                unknown_value=-1,
-                encoded_missing_value=-1,
-            ).set_output(transform='pandas')
-            self.oe_.fit(X_proc[self.cat_cols_])
-        else:
-            self.oe_ = None
-
-        return self
-
-    def transform(self, X):
-        X_proc = self.base_processor.transform(X)
-
-        # If processor returned non-DataFrame at fit time, or if no categorical columns 
-        # were detected at fit time - we do not attempt to encode anything and just return 
-        # the processor output unchanged.
-        if not isinstance(X_proc, pd.DataFrame) or not self.cat_cols_:
-            return X_proc
-
-        # Encode categorical and convert to pandas categorical dtype
-        X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
-
-        return X_proc
-
-class _IdentityProcessor(BaseEstimator, TransformerMixin):
-    """Processor fallback (identity)"""
-    def fit(self, X, y=None):
-        return self
-    
-    def transform(self, X):
-        return X.copy()
-
 # Type aliases 
 ModelKey = Literal['lgb', 'xgb', 'cb']
 PredictionType = Literal['classification', 'regression']
@@ -95,12 +33,13 @@ def cv_score_predict(
     verbose: int = 2,
     return_trained: bool = False,
     predict_proba: bool = True,
-) -> Tuple[pd.DataFrame, Optional[np.ndarray], Optional[List[Tuple[Any, Any]]]]:
+    return_raw_test_preds: bool = False, 
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[List[Tuple[Any, Any]]]]:
     """
     Cross-validate supported estimators (optionally repeated over multiple seeds),
     and return:
       - OOF predictions: one column per (model, seed)
-      - Test predictions: one column per (model, fold, seed) — i.e., per fitted model
+      - Test predictions: structure controlled by `return_raw_test_preds`
       - Optionally, trained pipelines
 
     Important behavior
@@ -156,15 +95,27 @@ def cv_score_predict(
     predict_proba : bool, default True
         For classification: if True return probabilities; if False return binary
         labels using `decision_threshold`. Ignored for regression.
+    return_raw_test_preds : bool, default False
+        Controls test prediction structure:
+        - If True: returns raw per-fold predictions with one column per 
+          (model, fold, seed) — columns named like 'lgb_seed_42_fold_0'.
+        - If False (default): averages predictions across folds for each 
+          (model, seed) combination, returning one column per (model, seed) 
+          that matches the OOF DataFrame's column structure and order.
 
     Returns
     -------
     oof_preds_df : pd.DataFrame
-        Raw OOF predictions. Shape: (n_samples, N), where N = n_models × n_folds × n_seeds.
-        Columns named like 'lgb_seed_42_fold_0'.
+        OOF predictions. Shape: (n_samples, N), where N = n_models × n_seeds.
+        Columns named like 'lgb_seed_42'.
     test_preds_df : pd.DataFrame or None
-        Raw test predictions. Shape: (len(X_test), N), same column order as oof_preds_df.
-        None if X_test is None.
+        Test predictions. If `X_test` is None, returns None.
+        - If `return_raw_test_preds=True`: shape (len(X_test), N_raw) with 
+          N_raw = n_models × n_folds × n_seeds, columns named like 
+          'lgb_seed_42_fold_0'.
+        - If `return_raw_test_preds=False` (default): shape (len(X_test), N) 
+          with N = n_models × n_seeds, columns named like 'lgb_seed_42', 
+          matching the OOF DataFrame column structure and order.
     trained_pipelines : list of (processor, model) tuples or None
         If return_trained=True, list of (fold_processor, model) for each model/fold/seed.
     """
@@ -421,6 +372,8 @@ def cv_score_predict(
             for metric_name, score in {k: float(np.mean(v)) for k, v in seed_stack_scores.items()}.items():
                 _print(f'  Stacked {metric_name}: {score:.5f}', level=2)
 
+    # --- End of seeds ---
+
     # Final summary
     if verbose >= 1:
         print('\n' + '=' * 30)
@@ -434,8 +387,19 @@ def cv_score_predict(
         print('\nMean Stacked CV Scores:')
         for metric_name, scores in cv_results['stacked'].items():
             print(f'  {metric_name}: {np.mean(scores):.5f}')
-    
-    # --- End of seeds ---
+
+    # Transform test predictions to match OOF structure if requested
+    if X_test is not None and not return_raw_test_preds:
+        # Build averaged test predictions DataFrame matching OOF structure
+        averaged_test_preds = pd.DataFrame(index=X_test.index, columns=oof_col_names, dtype=np.float64)
+        for seed in random_states:
+            for model_name in models:
+                oof_col = f"{model_name}_seed_{seed}"
+                # Find all fold columns for this (model, seed)
+                fold_cols = [f"{model_name}_seed_{seed}_fold_{fold}" for fold in range(n_splits)]
+                # Average across folds (preserves probability space before thresholding)
+                averaged_test_preds[oof_col] = test_preds_df[fold_cols].mean(axis=1)
+        test_preds_df = averaged_test_preds
 
     # Apply final thresholding if needed (only for classification)
     if pred_type == 'classification' and not predict_proba:
@@ -444,3 +408,64 @@ def cv_score_predict(
             test_preds_df = (test_preds_df >= decision_threshold).astype(int)
 
     return oof_preds_df, test_preds_df, trained_pipelines
+
+class _CatWrapper(BaseEstimator, TransformerMixin):
+    """
+    Applies base_processor, then OrdinalEncodes any object/category columns in its output.
+    """
+    def __init__(self, base_processor):
+        self.base_processor = base_processor
+
+    def fit(self, X, y=None):
+        X_proc = self.base_processor.fit_transform(X, y)
+
+        # If base_processor doesn't return a DataFrame, we won't attempt to detect or encode categories.
+        if not isinstance(X_proc, pd.DataFrame):
+            self._returns_df = False
+            self.cat_cols_ = []
+            self.oe_ = None
+
+            return self
+
+        self._returns_df = True
+
+        # Collect categorical/object columns (avoid select_dtypes to reduce intermediate objects)
+        self.cat_cols_ = []
+        for col, dtype in X_proc.dtypes.items():
+            if pd.api.types.is_object_dtype(dtype) or isinstance(dtype, pd.CategoricalDtype):
+                self.cat_cols_.append(col)
+
+        if self.cat_cols_:
+            self.oe_ = OrdinalEncoder(
+                dtype=np.int32,
+                handle_unknown='use_encoded_value',
+                unknown_value=-1,
+                encoded_missing_value=-1,
+            ).set_output(transform='pandas')
+            self.oe_.fit(X_proc[self.cat_cols_])
+        else:
+            self.oe_ = None
+
+        return self
+
+    def transform(self, X):
+        X_proc = self.base_processor.transform(X)
+
+        # If processor returned non-DataFrame at fit time, or if no categorical columns 
+        # were detected at fit time - we do not attempt to encode anything and just return 
+        # the processor output unchanged.
+        if not isinstance(X_proc, pd.DataFrame) or not self.cat_cols_:
+            return X_proc
+
+        # Encode categorical and convert to pandas categorical dtype
+        X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
+
+        return X_proc
+
+class _IdentityProcessor(BaseEstimator, TransformerMixin):
+    """Processor fallback (identity)"""
+    def fit(self, X, y=None):
+        return self
+    
+    def transform(self, X):
+        return X.copy()

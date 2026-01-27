@@ -20,7 +20,8 @@ def test_regression_without_preprocessor():
         n_splits=3,              # 3 folds
         predict_proba=False,     # ignored in regression
         return_trained=True,
-        verbose=0
+        verbose=0,
+        return_raw_test_preds=True,  
     )
 
     # --- Shape validation ---

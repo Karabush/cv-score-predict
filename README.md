@@ -1,7 +1,7 @@
 # cv-score-predict
 
-A robust utility for **cross-validated ensemble prediction** that performs per‑fold early stopping and exposes raw model outputs for advanced stacking, diagnostics, or custom ensembling.
-Each fold trains LightGBM, XGBoost, or CatBoost with early stopping on its validation split; the resulting estimators generate raw out-of-fold (OOF) and test predictions from every model, fold, and seed. The function supports custom preprocessing pipelines, dynamic per-fold categorical encoding, repeated CV over multiple seeds, and when requested — returns trained models along with their corresponding fold-specific preprocessors.
+A robust utility for **cross-validated ensemble prediction** that performs per‑fold early stopping and exposes flexible prediction outputs for advanced stacking, diagnostics, or custom ensembling.  
+Each fold trains LightGBM, XGBoost, or CatBoost with early stopping on its validation split; the resulting estimators generate out-of-fold (OOF) and test predictions with configurable aggregation. The function supports custom preprocessing pipelines, dynamic per-fold categorical encoding, repeated CV over multiple seeds, and when requested — returns trained models along with their corresponding fold-specific preprocessors.
 
 Designed for **kagglers, ML engineers, and data scientists** who need reliable, leakage-free CV with minimal boilerplate.
 
@@ -10,10 +10,11 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 ## ✨ Key Features
 
 - **Per‑fold early stopping**: Each fold trains with early stopping on its validation split and uses the early‑stopped estimator for OOF and test predictions.
-- **Raw prediction matrices**: Returns two DataFrames:
-    - `oof_preds_df`: raw OOF predictions — one column per (model, seed). Predictions from all folds for a given (model, seed) are stitched together into a single column.
-    - `test_preds_df`: raw test predictions — one column per (model, seed, fold), i.e., one prediction per fitted model.
-    - → Perfect for averaging, stacking, model blending, or error analysis.
+- **Flexible prediction structures** controlled by `return_raw_test_preds`:
+    - **OOF predictions** (`oof_preds_df`): Always one column per **(model, seed)** — predictions from all folds for a given (model, seed) are stitched together into a single complete column.
+    - **Test predictions** (`test_preds_df`):
+        - *Default (`return_raw_test_preds=False`)*: **Averaged across folds** → one column per **(model, seed)** matching OOF structure. Ideal for direct stacking/blending with OOF predictions.
+        - *Raw mode (`return_raw_test_preds=True`)*: **Per-fold predictions** → one column per **(model, seed, fold)**. Preserves fold-level variance for diagnostics or custom aggregation.
 - **Multi-model support**: Train LightGBM (`'lgb'`), XGBoost (`'xgb'`), and CatBoost (`'cb'`) in the same CV loop.
 - **Safe fold-wise preprocessing**: Accepts any scikit-learn–compatible processor with `fit_transform`/`transform`. Fitted independently per fold to prevent data leakage.
 - **Dynamic categorical handling**: When `process_categorical=True`, the function:
@@ -57,6 +58,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `verbose` | `int` | `2` | Logging level: `2` = full per-fold details, `1` = final summary, `0` = silent. |
 | `return_trained` | `bool` | `False` | If True, returns a list of (fold_processor, model) tuples (one per model × fold × seed). |
 | `predict_proba` | `bool` | `True` | For classification: if `True`, return probabilities; if `False`, return binary labels (using `decision_threshold`). Ignored for regression. |
+| `return_raw_test_preds` | `bool` | `False` | Controls test prediction structure:<br>- `False` (default): Average predictions across folds per (model, seed) → matches OOF structure.<br>- `True`: Return raw per-fold predictions → one column per (model, seed, fold). |
 ---
 
 ## 🚀 Installation
@@ -86,7 +88,7 @@ X = pd.DataFrame({
 y = [0, 1, 0, 1, 1, 0, 1, 0]
 X_test = pd.DataFrame({"num": [9, 10], "cat": ["B", "E"]})
 
-# Run CV with 2 seeds → get raw prediction matrices
+# Run CV with 2 seeds → get OOF and *averaged* test predictions
 oof_preds_df, test_preds_df, _ = cv_score_predict(
     X=X,
     y=y,
@@ -99,14 +101,17 @@ oof_preds_df, test_preds_df, _ = cv_score_predict(
     verbose=2,
 )
 
-# Analyze OOF predictions
-print("OOF predictions shape:", oof_preds_df.shape)   # e.g., (8, 4) → 2 models × 2 seeds
-print("Test predictions shape:", test_preds_df.shape) # e.g., (2, 8) → 2 models × 2 seeds × 2 folds
+# Analyze prediction structures
+print("OOF predictions shape:", oof_preds_df.shape)   # (8, 4) → 2 models × 2 seeds
+print("Test predictions shape:", test_preds_df.shape) # (2, 4) → 2 models × 2 seeds (averaged across folds)
 print(oof_preds_df.columns.tolist())
 # ['lgb_seed_42', 'xgb_seed_42', 'lgb_seed_123', 'xgb_seed_123']
+print(test_preds_df.columns.tolist())
+# ['lgb_seed_42', 'xgb_seed_42', 'lgb_seed_123', 'xgb_seed_123'] ← matches OOF!
 
-# Average across all models/seeds for a final OOF prediction
+# Direct stacking: average OOF and test predictions together
 final_oof = oof_preds_df.mean(axis=1)
+final_test = test_preds_df.mean(axis=1)
 ```
 
 💡 Note: OOF predictions are already stitched across folds per (model, seed), so each OOF column is complete. Test predictions remain per-fold to preserve variance estimation.
@@ -168,9 +173,12 @@ This gives you a leakage-free stacking pipeline with proper early stopping and c
 ---
 
 ## 📝 Notes
-* Column naming: 
-    - OOF: `{model}_seed_{seed}`
-    - Test: `{model}_seed_{seed}_fold_{fold}`
+* Column naming conventions:
+  - OOF predictions: `{model}_seed_{seed}`(always)
+  - Test predictions:
+      - Averaged mode (`return_raw_test_preds=False`): `{model}_seed_{seed}` ← matches OOF
+      - Raw mode (`return_raw_test_preds=True`): `{model}_seed_{seed}_fold_{fold}`
+* Averaging happens before thresholding: Probabilities are averaged across folds first, then thresholded (when `predict_proba=False`). This preserves probability semantics and avoids averaging binary labels.
 * Always use `.set_output(transform="pandas")` in sklearn pipelines to preserve column names and dtypes.
 * Categorical detection happens after your base processor runs—so even if your pipeline creates or modifies categorical columns, they’ll be handled correctly when `process_categorical=True`.
 

@@ -32,12 +32,13 @@ def test_classification_with_categorical_encoding_and_preprocessor():
         random_state=[42, 99],
         n_splits=2,
         return_trained=True,
-        verbose=0
+        verbose=0,
+        return_raw_test_preds=True,  
     )
 
     # Shape checks
-    assert oof_df.shape == (8, 4)  # 2 models × 2 seeds
-    assert test_df.shape == (2, 8)  # 2 models × 2 folds × 2 seeds
+    assert oof_df.shape == (8, 4)  # 2 models × 2 seeds ✓
+    assert test_df.shape == (2, 8)  # 2 models × 2 folds × 2 seeds ✓
 
     # No NaNs in OOF
     assert not oof_df.isna().any().any(), "OOF must be fully populated"
@@ -53,6 +54,6 @@ def test_classification_with_categorical_encoding_and_preprocessor():
     fold_processor, _ = trained_artifacts[0]
     X_test_transformed = fold_processor.transform(X_test)
     cat_encoded = X_test_transformed["cat"]
-    assert cat_encoded.iloc[1] == -1
-    assert isinstance(cat_encoded.dtype, pd.CategoricalDtype)
-    assert not np.allclose(X_test_transformed["num"], X_test["num"])
+    assert cat_encoded.iloc[1] == -1, "Unseen category 'V' must encode to -1"
+    assert isinstance(cat_encoded.dtype, pd.CategoricalDtype), "Encoded column must be categorical dtype"
+    assert not np.allclose(X_test_transformed["num"], X_test["num"]), "Numerical column must be scaled"
