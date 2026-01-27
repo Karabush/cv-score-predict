@@ -41,6 +41,7 @@ htmlcov/
 
 # OS
 .DS_Store
+.venv
 Thumbs.db
 
 # Logs and temp files
