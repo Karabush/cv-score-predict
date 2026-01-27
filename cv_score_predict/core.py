@@ -458,7 +458,23 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
             return X_proc
 
         # Encode categorical and convert to pandas categorical dtype
-        X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
+        if self.cat_cols_:
+            encoded = self.oe_.transform(X_proc[self.cat_cols_])
+            if isinstance(encoded, pd.DataFrame):
+                for col in self.cat_cols_:
+                    # Force fresh Series creation to bypass pandas CoW/view issues
+                    X_proc[col] = pd.Series(
+                        encoded[col].values,
+                        index=X_proc.index,
+                        dtype='category'
+                    )
+            else:  # numpy array
+                for i, col in enumerate(self.cat_cols_):
+                    X_proc[col] = pd.Series(
+                        encoded[:, i],
+                        index=X_proc.index,
+                        dtype='category'
+                    )
 
         return X_proc
 
