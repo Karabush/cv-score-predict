@@ -17,11 +17,15 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
         - *Raw mode (`return_raw_test_preds=True`)*: **Per-fold predictions** → one column per **(model, seed, fold)**. Preserves fold-level variance for diagnostics or custom aggregation.
 - **Multi-model support**: Train LightGBM (`'lgb'`), XGBoost (`'xgb'`), and CatBoost (`'cb'`) in the same CV loop.
 - **Safe fold-wise preprocessing**: Accepts any scikit-learn–compatible processor with `fit_transform`/`transform`. Fitted independently per fold to prevent data leakage.
-- **Dynamic categorical handling**: When `process_categorical=True`, the function:
-    - Detects object/category columns after the base processor runs,
-    - Fits an `OrdinalEncoder` per fold (using `-1` for missing/unseen categories),
-    - Converts encoded columns to pandas `'category'` dtype so boosting libraries auto-detect them,
-    - Automatically sets model-specific flags: `enable_categorical=True` for XGBoost, `cat_features=col_names` for CatBoost. LightGBM requires no extra flag thanks to pandas categorical dtype.
+- **Automatic robust categorical handling** (always enabled):
+    - Detects object/string/categorical columns **after** the base processor runs,
+    - Fits an `OrdinalEncoder` per fold with explicit unseen-category handling:
+        - Unseen categories → encoded as `-1`
+        - Missing values → encoded as `-1`
+        - Training data guaranteed to contain `-1` via `encoded_missing_value=-1`
+    - Converts encoded integers to pandas `'category'` dtype for native booster support
+    - Automatically sets model-specific flags: `enable_categorical=True` for XGBoost, `cat_features=col_names` for CatBoost. LightGBM auto-detects categories from dtype.
+    - **Critical benefit**: Satisfies XGBoost's strict validation (all test categories must exist in training) while handling unseen values gracefully.
 - **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed, and all raw predictions are preserved.
 - **Flexible scoring and thresholding**: 
     - Custom `scoring_dict` supported (e.g., accuracy, log loss, RMSE).
@@ -47,7 +51,6 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `X_test` | `Optional[pd.DataFrame]` | `None` | Test set for final prediction. If `None`, no test predictions are returned. |
 | `pred_type` | `str` | — | Either `'classification'` or `'regression'` (**required**). |
 | `processor` | `Optional[object]` | `None` | Preprocessing pipeline with `fit_transform` and `transform` methods. Must return a `pd.DataFrame` (use `set_output(transform='pandas')`). If `None`, features are passed through unchanged. |
-| `process_categorical` | `bool` | `True` | If True, object/category columns in the processor’s output are encoded per fold with OrdinalEncoder (using -1 for missing/unseen) and converted to pandas 'category' dtype. |
 | `models` | `Union[List[str], str]` | `('lgb', 'xgb', 'cb')` | Models to ensemble. Supported: `'lgb'` (LightGBM), `'xgb'` (XGBoost), `'cb'` (CatBoost). |
 | `params_dict` | `Optional[Dict[str, dict]]` | `None` | Model-specific hyperparameters. Keys: model names; values: param dicts. |
 | `scoring_dict` | `Optional[Dict[str, Callable]]` | `None` | Metrics for evaluation. Keys: metric names; values: scoring functions (e.g., `roc_auc_score`). Defaults: `{'roc_auc': roc_auc_score}` (classification), `{'rmse': rmse_fn}` (regression). |
@@ -77,7 +80,7 @@ Requirements:
 
 ## 📌 Basic Usage
 ```python
-iimport pandas as pd
+import pandas as pd
 from cv_score_predict import cv_score_predict
 
 # Simulate data
@@ -86,7 +89,7 @@ X = pd.DataFrame({
     "cat": ["A", "B", "A", "C", "B", "A", "C", "D"]
 })
 y = [0, 1, 0, 1, 1, 0, 1, 0]
-X_test = pd.DataFrame({"num": [9, 10], "cat": ["B", "E"]})
+X_test = pd.DataFrame({"num": [9, 10], "cat": ["B", "E"]})  # 'E' is unseen
 
 # Run CV with 2 seeds → get OOF and *averaged* test predictions
 oof_preds_df, test_preds_df, _ = cv_score_predict(
@@ -94,7 +97,6 @@ oof_preds_df, test_preds_df, _ = cv_score_predict(
     y=y,
     X_test=X_test,
     pred_type="classification",
-    process_categorical=True,
     models=["lgb", "xgb"],
     random_state=[42, 123],
     n_splits=2,
@@ -113,8 +115,6 @@ print(test_preds_df.columns.tolist())
 final_oof = oof_preds_df.mean(axis=1)
 final_test = test_preds_df.mean(axis=1)
 ```
-
-💡 Note: OOF predictions are already stitched across folds per (model, seed), so each OOF column is complete. Test predictions remain per-fold to preserve variance estimation.
 
 ---
 
@@ -147,7 +147,6 @@ oof_preds_df, _, trained_pipelines = cv_score_predict(
     X_test=None,
     pred_type="classification",
     processor=base_processor,
-    process_categorical=True,
     models=["lgb", "xgb", "cb"],
     params_dict=params_dict,
     scoring_dict=scoring_dict,
@@ -155,13 +154,13 @@ oof_preds_df, _, trained_pipelines = cv_score_predict(
     n_splits=5,
     return_trained=True,
 )
-# Create new data
-X_new = pd.DataFrame({"num": [7, 8], "cat": [None, "A"]})
+# Create new data with unseen category and missing value
+X_new = pd.DataFrame({"num": [7, 8], "cat": [None, "Z"]})
 
 # Transform and predict using each trained pipeline
 all_new_preds = []
 for fold_processor, model in trained_pipelines:
-    X_new_proc = fold_processor.transform(X_new)
+    X_new_proc = fold_processor.transform(X_new)  # Handles None/'Z' → -1 automatically
     pred = model.predict_proba(X_new_proc)[:, 1]
     all_new_preds.append(pred)
 
@@ -173,6 +172,7 @@ This gives you a leakage-free stacking pipeline with proper early stopping and c
 ---
 
 ## 📝 Notes
+* Categorical handling is always active — detection happens after your base processor runs, so processors that create/modify categoricals (e.g., binning) work correctly.
 * Column naming conventions:
   - OOF predictions: `{model}_seed_{seed}`(always)
   - Test predictions:
@@ -180,7 +180,6 @@ This gives you a leakage-free stacking pipeline with proper early stopping and c
       - Raw mode (`return_raw_test_preds=True`): `{model}_seed_{seed}_fold_{fold}`
 * Averaging happens before thresholding: Probabilities are averaged across folds first, then thresholded (when `predict_proba=False`). This preserves probability semantics and avoids averaging binary labels.
 * Always use `.set_output(transform="pandas")` in sklearn pipelines to preserve column names and dtypes.
-* Categorical detection happens after your base processor runs—so even if your pipeline creates or modifies categorical columns, they’ll be handled correctly when `process_categorical=True`.
 
 ---
 

@@ -7,11 +7,11 @@ import lightgbm as lgb
 import xgboost as xgb 
 import catboost as cb 
 
-from copy import deepcopy
 from sklearn.model_selection import StratifiedKFold, KFold 
 from sklearn.metrics import roc_auc_score, mean_squared_error
-from sklearn.preprocessing import OrdinalEncoder
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.preprocessing import FunctionTransformer, OrdinalEncoder
+
 # Type aliases 
 ModelKey = Literal['lgb', 'xgb', 'cb']
 PredictionType = Literal['classification', 'regression']
@@ -22,7 +22,6 @@ def cv_score_predict(
     X_test: Optional[pd.DataFrame] = None,
     pred_type: PredictionType = None,
     processor: Optional[Union[BaseEstimator, TransformerMixin]] = None,
-    process_categorical: bool = True,
     models: Union[List[ModelKey], ModelKey] = ('lgb', 'xgb', 'cb'),
     params_dict: Optional[Dict[str, dict]] = None,
     scoring_dict: Optional[Dict[str, Callable]] = None,
@@ -36,18 +35,24 @@ def cv_score_predict(
     return_raw_test_preds: bool = False, 
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[List[Tuple[Any, Any]]]]:
     """
-    Cross-validate supported estimators (optionally repeated over multiple seeds),
-    and return:
-      - OOF predictions: one column per (model, seed)
-      - Test predictions: structure controlled by `return_raw_test_preds`
-      - Optionally, trained pipelines
-
-    Important behavior
-    ------------------
-    Estimators are trained with early stopping on each fold's validation set. 
-    If custom model parameters are provided, number of iterations should be reasonable high
-    to allow space for early stopping. Final test predictions (when `X_test` is provided) 
-    are produced by the early‑stopped estimators from each fold.
+    Cross-validate gradient boosting estimators with robust categorical handling.
+    
+    Automatically applies categorical preprocessing AFTER the user-provided `processor`:
+      1. Detects object/string/categorical columns in processor output
+      2. Applies OrdinalEncoder with explicit unseen-category handling:
+         - Unseen categories → encoded as -1
+         - Missing values → encoded as -1
+         - Training data guaranteed to contain -1 via `encoded_missing_value=-1`
+      3. Converts encoded integers to pandas 'category' dtype for native booster support
+    
+    This pattern ensures compatibility across all supported libraries:
+      • XGBoost: Satisfies strict requirement that all test categories exist in training
+      • LightGBM: Extracts integer codes from category dtype (handles -1 as missing)
+      • CatBoost: Accepts integer-encoded categoricals via explicit `cat_features`
+    
+    Estimators are trained with early stopping on each fold's validation set. Final test
+    predictions (when `X_test` is provided) are produced by the early-stopped estimators
+    from each fold and averaged across folds for each (model, seed) combination.
 
     Parameters
     ----------
@@ -61,12 +66,7 @@ def cv_score_predict(
         Either 'classification' or 'regression'.
     processor : object or None, optional
         Preprocessing pipeline with `fit_transform` and `transform` methods.
-    process_categorical : bool, default True
-        If True, object/category columns are encoded using an OrdinalEncoder
-        fitted on the training DataFrame only (no leakage), then converted to
-        pandas `category` dtype so libraries that auto‑detect categories work
-        correctly. If False, the user is responsible for categorical handling
-        (for example, inside `processor`).
+        Applied BEFORE categorical conversion. If None, features pass through unchanged.
     models : list or str, default ('lgb', 'xgb', 'cb')
         Model keys to train. Supported values: 'lgb', 'xgb', 'cb'.
     params_dict : dict or None, optional
@@ -76,7 +76,7 @@ def cv_score_predict(
         Mapping `metric_name -> callable(y_true, y_pred_or_proba)`. If None,
         defaults are provided (classification: ROC AUC; regression: RMSE).
     decision_threshold : float, default 0.5
-        Threshold to convert probabilities to class labels for threshold‑based metrics.
+        Threshold to convert probabilities to class labels for threshold-based metrics.
     n_splits : int, default 5
         Number of CV folds.
     random_state : int or list of ints, default 42
@@ -84,7 +84,7 @@ def cv_score_predict(
     early_stopping_rounds : int, default 50
         Default early stopping rounds used when model params do not override it.
     verbose : int, default 2
-        2 prints detailed per‑fold/per‑model scores,
+        2 prints detailed per-fold/per-model scores,
         1 prints only final averaged scores,
         0 prints nothing.
     return_trained : bool, default False
@@ -179,8 +179,9 @@ def cv_score_predict(
         for m in models:
             params_dict.setdefault(m, {})
 
+    # Setup base processor (identity if None)
     if processor is None:
-        base_processor = _IdentityProcessor()
+        base_processor = FunctionTransformer(lambda X: X.copy(), validate=False)
     elif not hasattr(processor, 'fit_transform') or not hasattr(processor, 'transform'):
         raise TypeError("`processor` must have `fit_transform` and `transform` methods.")
     else:
@@ -217,12 +218,8 @@ def cv_score_predict(
             X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
-            # Choose preprocessor based on process_categorical
-            if process_categorical:
-                fold_base = deepcopy(base_processor)
-                fold_processor = _CatWrapper(fold_base)
-            else:
-                fold_processor = deepcopy(base_processor)
+            # Always wrap processor to handle categoricals post-transformation
+            fold_processor = _CatWrapper(clone(base_processor))
 
             # Apply processor to current fold
             X_train = fold_processor.fit_transform(X_train, y_train)
@@ -236,7 +233,7 @@ def cv_score_predict(
             local_params_dict = {}
             for m in models:
                 p = params_dict[m].copy()
-                if cat_cols and process_categorical:
+                if cat_cols:
                     # lgb handles categories automatically via pandas categorical dtype
                     if m == 'xgb':
                         p['enable_categorical'] = True
@@ -411,62 +408,58 @@ def cv_score_predict(
 
 class _CatWrapper(BaseEstimator, TransformerMixin):
     """
-    Applies base_processor, then OrdinalEncodes any object/category columns in its output.
+    Wraps a base processor and ensures robust categorical handling for gradient boosters.
+    
+    After applying `base_processor.fit_transform()`, detects columns with object/string/
+    categorical dtypes and applies OrdinalEncoder with explicit unseen-category handling:
+      - Unseen categories → encoded as -1
+      - Missing values → encoded as -1
+      - Training data guaranteed to contain -1 via `encoded_missing_value=-1`
+    
+    Final output converts encoded integers to pandas 'category' dtype. This pattern:
+      • Satisfies XGBoost's strict requirement that all test categories exist in training
+      • Works seamlessly with LightGBM (extracts integer codes) and CatBoost
+      • Handles missing/unseen values gracefully without data leakage
+    
+    Attributes
+    ----------
+    cat_cols_ : List[str]
+        Column names detected as categorical-like after base_processor transformation.
+    oe_ : OrdinalEncoder or None
+        Fitted encoder for categorical columns, or None if no categoricals detected.
     """
     def __init__(self, base_processor):
         self.base_processor = base_processor
 
     def fit(self, X, y=None):
         X_proc = self.base_processor.fit_transform(X, y)
-
-        # If base_processor doesn't return a DataFrame, we won't attempt to detect or encode categories.
-        if not isinstance(X_proc, pd.DataFrame):
-            self._returns_df = False
-            self.cat_cols_ = []
-            self.oe_ = None
-
-            return self
-
-        self._returns_df = True
-
-        # Collect categorical/object columns (avoid select_dtypes to reduce intermediate objects)
-        self.cat_cols_ = [
-            col for col, dtype in X_proc.dtypes.items() 
-            if pd.api.types.is_object_dtype(dtype) 
-            or pd.api.types.is_string_dtype(dtype) 
-            or isinstance(dtype, pd.CategoricalDtype)
+        if isinstance(X_proc, pd.DataFrame):
+            self.cat_cols_ = [
+                col for col, dtype in X_proc.dtypes.items()
+                if pd.api.types.is_object_dtype(dtype)
+                or pd.api.types.is_string_dtype(dtype)
+                or isinstance(dtype, pd.CategoricalDtype)
             ]
-        if self.cat_cols_:
-            self.oe_ = OrdinalEncoder(
-                dtype=np.int32,
-                handle_unknown='use_encoded_value',
-                unknown_value=-1,
-                encoded_missing_value=-1,
-            ).set_output(transform='pandas')
-            self.oe_.fit(X_proc[self.cat_cols_])
+            if self.cat_cols_:
+                self.oe_ = OrdinalEncoder(
+                    dtype=np.int32,
+                    handle_unknown='use_encoded_value',
+                    unknown_value=-1,
+                    encoded_missing_value=-1,
+                ).set_output(transform='pandas')
+                self.oe_.fit(X_proc[self.cat_cols_])
+            else:
+                self.oe_ = None
         else:
+            self.cat_cols_ = []
             self.oe_ = None
 
         return self
 
     def transform(self, X):
         X_proc = self.base_processor.transform(X)
-
-        # If processor returned non-DataFrame at fit time, or if no categorical columns 
-        # were detected at fit time - we do not attempt to encode anything and just return 
-        # the processor output unchanged.
-        if not isinstance(X_proc, pd.DataFrame) or not self.cat_cols_:
-            return X_proc
-
-        # Encode categorical and convert to pandas categorical dtype
-        X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
+        if isinstance(X_proc, pd.DataFrame) and self.cat_cols_ and self.oe_ is not None:
+            X_proc = X_proc.copy()
+            X_proc[self.cat_cols_] = self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
 
         return X_proc
-
-class _IdentityProcessor(BaseEstimator, TransformerMixin):
-    """Processor fallback (identity)"""
-    def fit(self, X, y=None):
-        return self
-    
-    def transform(self, X):
-        return X.copy()
