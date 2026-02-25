@@ -7,7 +7,7 @@ import lightgbm as lgb
 import xgboost as xgb 
 import catboost as cb 
 
-from sklearn.model_selection import StratifiedKFold, KFold 
+from sklearn.model_selection import StratifiedKFold, KFold, StratifiedGroupKFold, GroupKFold
 from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.preprocessing import FunctionTransformer, OrdinalEncoder
@@ -33,6 +33,7 @@ def cv_score_predict(
     return_trained: bool = False,
     predict_proba: bool = True,
     return_raw_test_preds: bool = False, 
+    cv_groups: Optional[Union[pd.Series, np.ndarray]] = None,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[List[Tuple[Any, Any]]]]:
     """
     Cross-validate gradient boosting estimators with robust categorical handling.
@@ -102,6 +103,10 @@ def cv_score_predict(
         - If False (default): averages predictions across folds for each 
           (model, seed) combination, returning one column per (model, seed) 
           that matches the OOF DataFrame's column structure and order.
+    cv_groups : pd.Series or np.ndarray, optional
+        Group labels for group-wise CV splitting. If provided, `StratifiedGroupKFold` is used 
+        instead of `StratifiedKFold` for classification or `GroupKFold` instead of `KFold` for regression.
+        Length must match `X` and `y`. If None (default), standard StratifiedKFold or KFold is used.
 
     Returns
     -------
@@ -203,16 +208,46 @@ def cv_score_predict(
     # Main loop across random states
     for seed in random_states:
         _print(f'\n=== Random State {seed} ===', level=2)
-        splitter = (
-            StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-            if pred_type == 'classification'
-            else KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        )
+        # Validate cv_group if provided
+        if cv_groups is not None:
+            cv_groups = cv_groups.values if isinstance(cv_groups, pd.Series) else np.asarray(cv_groups)
+                
+            if len(cv_groups) != len(X):
+                raise ValueError("Length of `cv_groups` must match number of samples in `X`.")
+
+            # Choose grouped splitter
+            if pred_type == 'classification':
+                splitter = StratifiedGroupKFold(
+                    n_splits=n_splits, 
+                    shuffle=True, 
+                    random_state=seed,
+                )
+                split_args = (X, y, cv_groups)
+            else:
+                splitter = GroupKFold(n_splits=n_splits)
+                split_args = (X, y, cv_groups)
+
+        else:
+            # Regular CV (original behavior)
+            if pred_type == 'classification':
+                splitter = StratifiedKFold(
+                    n_splits=n_splits, 
+                    shuffle=True, 
+                    random_state=seed
+                )
+            else:
+                splitter = KFold(
+                    n_splits=n_splits, 
+                    shuffle=True, 
+                    random_state=seed
+                )
+            split_args = (X, y)
+
         # Per-seed storage for reporting 
         seed_model_scores = {m: {name: [] for name in scoring_dict.keys()} for m in models}
         seed_stack_scores = {metric_name: [] for metric_name in scoring_dict.keys()}
         
-        for fold, (train_idx, val_idx) in enumerate(splitter.split(X, y)):
+        for fold, (train_idx, val_idx) in enumerate(splitter.split(*split_args)):
             _print(f'\nFold {fold + 1}/{n_splits}', level=2)
 
             X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()

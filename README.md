@@ -27,6 +27,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
     - Automatically sets model-specific flags: `enable_categorical=True` for XGBoost, `cat_features=col_names` for CatBoost. LightGBM auto-detects categories from dtype.
     - **Critical benefit**: Satisfies XGBoost's strict validation (all test categories must exist in training) while handling unseen values gracefully.
 - **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed, and all raw predictions are preserved.
+- **Grouped cross-validation support**: Pass `cv_groups` (array/Series of group labels) to use `StratifiedGroupKFold` (classification) or `GroupKFold` (regression). Ensures samples from the same temporal group (e.g., quarter, year) stay together, preventing temporal leakage. Falls back to regular CV when `cv_groups=None`.
 - **Flexible scoring and thresholding**: 
     - Custom `scoring_dict` supported (e.g., accuracy, log loss, RMSE).
     - Defaults: ROC AUC for classification, RMSE for regression.
@@ -56,6 +57,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `scoring_dict` | `Optional[Dict[str, Callable]]` | `None` | Metrics for evaluation. Keys: metric names; values: scoring functions (e.g., `roc_auc_score`). Defaults: `{'roc_auc': roc_auc_score}` (classification), `{'rmse': rmse_fn}` (regression). |
 | `decision_threshold` | `float` | `0.5` | Threshold to convert probabilities to class labels (classification only). |
 | `n_splits` | `int` | `5` | Number of cross-validation folds. |
+| `cv_groups` | `Optional[Union[np.ndarray, pd.Series, List]]` | `None` | Group labels for grouped cross-validation. If provided, uses `StratifiedGroupKFold` (classification) instead of `StratifiedKFold` or `GroupKFold` (regression) instead of regular `KFold`. |
 | `random_state` | `Union[int, List[int]]` | `42` | Seed(s) for reproducibility. If a list, CV is repeated for each seed and results are averaged. |
 | `early_stopping_rounds` | `int` | `50` | Early stopping rounds for boosting models (if not overridden in `params_dict`). |
 | `verbose` | `int` | `2` | Logging level: `2` = full per-fold details, `1` = final summary, `0` = silent. |

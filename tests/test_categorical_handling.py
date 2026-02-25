@@ -74,7 +74,7 @@ def test_robust_categorical_handling():
     
     # All categorical columns must be category dtype
     for col in ["cat_low_card", "cat_high_card"]:
-        assert pd.api.types.is_categorical_dtype(X_test_transformed[col]), \
+        assert isinstance(X_test_transformed[col].dtype, pd.CategoricalDtype), \
             f"Column '{col}' not converted to category dtype (got {X_test_transformed[col].dtype})"
         
         # CRITICAL: Check CATEGORIES (display values), not codes
