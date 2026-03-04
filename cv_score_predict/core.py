@@ -1,15 +1,16 @@
 from typing import (
     Union, List, Dict, Tuple, Optional, Callable, Any, Literal,
 )
+import copy
 import numpy as np 
 import pandas as pd 
 import lightgbm as lgb 
 import xgboost as xgb 
 import catboost as cb 
 
-from sklearn.model_selection import StratifiedKFold, KFold, StratifiedGroupKFold, GroupKFold
+from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.metrics import roc_auc_score, mean_squared_error
-from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import FunctionTransformer, OrdinalEncoder
 
 # Type aliases 
@@ -33,6 +34,7 @@ def cv_score_predict(
     return_trained: bool = False,
     predict_proba: bool = True,
     return_raw_test_preds: bool = False, 
+    cv_splitter: Optional[Any] = None,
     cv_groups: Optional[Union[pd.Series, np.ndarray]] = None,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[List[Tuple[Any, Any]]]]:
     """
@@ -79,7 +81,7 @@ def cv_score_predict(
     decision_threshold : float, default 0.5
         Threshold to convert probabilities to class labels for threshold-based metrics.
     n_splits : int, default 5
-        Number of CV folds.
+        Number of CV folds. Ignored if `cv_splitter` is provided.
     random_state : int or list of ints, default 42
         Single seed or list of seeds to repeat CV. Results are averaged across seeds.
     early_stopping_rounds : int, default 50
@@ -103,10 +105,15 @@ def cv_score_predict(
         - If False (default): averages predictions across folds for each 
           (model, seed) combination, returning one column per (model, seed) 
           that matches the OOF DataFrame's column structure and order.
+    cv_splitter : object, optional
+        A pre-configured CV splitter instance (e.g., PurgedKFold, TimeSeriesSplit).
+        If provided, this overrides `n_splits` and automatic splitter selection logic.
+        The splitter must implement a `split(X, y, [groups])` method.
+        If `random_state` is a list, this splitter will be cloned for each seed.
     cv_groups : pd.Series or np.ndarray, optional
-        Group labels for group-wise CV splitting. If provided, `StratifiedGroupKFold` is used 
-        instead of `StratifiedKFold` for classification or `GroupKFold` instead of `KFold` for regression.
-        Length must match `X` and `y`. If None (default), standard StratifiedKFold or KFold is used.
+        Group labels for CV splitting. Must be provided if `cv_splitter` requires groups.
+        If `cv_splitter` is None, this must also be None (internal group splitters removed).
+        Length must match `X` and `y`.
 
     Returns
     -------
@@ -149,6 +156,12 @@ def cv_score_predict(
     if len(X) != len(y):
         raise ValueError("`X` and `y` must have the same number of samples.")
     
+    if cv_splitter is None and cv_groups is not None:
+        raise ValueError(
+            "`cv_groups` is provided but `cv_splitter` is None. "
+            "Please provide a custom `cv_splitter` (e.g., GroupKFold) to use `cv_groups`."
+        )
+
     # Ensure y as pd.Series for consistent indexing with iloc
     y = y if isinstance(y, pd.Series) else pd.Series(y)
 
@@ -157,16 +170,10 @@ def cv_score_predict(
     oof_preds_df = pd.DataFrame(index=X.index, columns=oof_col_names, dtype=np.float64)
     oof_preds_df[:] = np.nan  
 
-    # Initialize test preds: one column per (model, fold, seed)
+    # Initialize test preds: Dynamic column creation handled in loop
     test_preds_df = None
     if X_test is not None:
-        test_col_names = [
-            f"{m}_seed_{seed}_fold_{fold}"
-            for seed in random_states
-            for fold in range(n_splits)
-            for m in models
-        ]
-        test_preds_df = pd.DataFrame(index=X_test.index, columns=test_col_names, dtype=np.float64)
+        test_preds_df = pd.DataFrame(index=X_test.index, dtype=np.float64)
 
     # Default scoring
     if scoring_dict is None:
@@ -208,27 +215,26 @@ def cv_score_predict(
     # Main loop across random states
     for seed in random_states:
         _print(f'\n=== Random State {seed} ===', level=2)
-        # Validate cv_group if provided
-        if cv_groups is not None:
-            cv_groups = cv_groups.values if isinstance(cv_groups, pd.Series) else np.asarray(cv_groups)
-                
-            if len(cv_groups) != len(X):
-                raise ValueError("Length of `cv_groups` must match number of samples in `X`.")
-
-            # Choose grouped splitter
-            if pred_type == 'classification':
-                splitter = StratifiedGroupKFold(
-                    n_splits=n_splits, 
-                    shuffle=True, 
-                    random_state=seed,
-                )
-                split_args = (X, y, cv_groups)
-            else:
-                splitter = GroupKFold(n_splits=n_splits)
-                split_args = (X, y, cv_groups)
-
+        
+        # Determine splitter
+        if cv_splitter is not None:
+            # Use custom splitter
+            splitter = copy.deepcopy(cv_splitter)
+            
+            # Try to set random state if the splitter supports it
+            if hasattr(splitter, 'random_state'):
+                splitter.random_state = seed
+            
+            # Warn if n_splits attribute exists but differs from function arg
+            if hasattr(splitter, 'n_splits') and splitter.n_splits != n_splits:
+                _print(f"Warning: splitter.n_splits ({splitter.n_splits}) differs from function arg n_splits ({n_splits}). Using splitter's value.", level=1)
+            
+            split_args = (X, y)
+            split_kwargs = {}
+            if cv_groups is not None:
+                split_kwargs['groups'] = cv_groups
         else:
-            # Regular CV (original behavior)
+            # Regular CV (standard sklearn splitters)
             if pred_type == 'classification':
                 splitter = StratifiedKFold(
                     n_splits=n_splits, 
@@ -242,19 +248,20 @@ def cv_score_predict(
                     random_state=seed
                 )
             split_args = (X, y)
+            split_kwargs = {}
 
         # Per-seed storage for reporting 
         seed_model_scores = {m: {name: [] for name in scoring_dict.keys()} for m in models}
         seed_stack_scores = {metric_name: [] for metric_name in scoring_dict.keys()}
         
-        for fold, (train_idx, val_idx) in enumerate(splitter.split(*split_args)):
-            _print(f'\nFold {fold + 1}/{n_splits}', level=2)
+        for fold, (train_idx, val_idx) in enumerate(splitter.split(*split_args, **split_kwargs)):
+            _print(f'\nFold {fold + 1}', level=2)
 
             X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
             # Always wrap processor to handle categoricals post-transformation
-            fold_processor = _CatWrapper(clone(base_processor))
+            fold_processor = _CatWrapper(copy.deepcopy(base_processor))
 
             # Apply processor to current fold
             X_train = fold_processor.fit_transform(X_train, y_train)
@@ -427,10 +434,13 @@ def cv_score_predict(
         for seed in random_states:
             for model_name in models:
                 oof_col = f"{model_name}_seed_{seed}"
-                # Find all fold columns for this (model, seed)
-                fold_cols = [f"{model_name}_seed_{seed}_fold_{fold}" for fold in range(n_splits)]
+                # Find all fold columns for this (model, seed) dynamically
+                fold_cols = [c for c in test_preds_df.columns if c.startswith(f"{model_name}_seed_{seed}_fold_")]
                 # Average across folds (preserves probability space before thresholding)
-                averaged_test_preds[oof_col] = test_preds_df[fold_cols].mean(axis=1)
+                if fold_cols:
+                    averaged_test_preds[oof_col] = test_preds_df[fold_cols].mean(axis=1)
+                else:
+                    averaged_test_preds[oof_col] = np.nan
         test_preds_df = averaged_test_preds
 
     # Apply final thresholding if needed (only for classification)
@@ -446,15 +456,8 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
     Wraps a base processor and ensures robust categorical handling for gradient boosters.
     
     After applying `base_processor.fit_transform()`, detects columns with object/string/
-    categorical dtypes and applies OrdinalEncoder with explicit unseen-category handling:
-      - Unseen categories → encoded as -1
-      - Missing values → encoded as -1
-      - Training data guaranteed to contain -1 via `encoded_missing_value=-1`
-    
-    Final output converts encoded integers to pandas 'category' dtype. This pattern:
-      • Satisfies XGBoost's strict requirement that all test categories exist in training
-      • Works seamlessly with LightGBM (extracts integer codes) and CatBoost
-      • Handles missing/unseen values gracefully without data leakage
+    categorical dtypes and applies OrdinalEncoder with explicit unseen-category handling.    
+    Final output converts encoded integers to pandas 'category' dtype. 
     
     Attributes
     ----------

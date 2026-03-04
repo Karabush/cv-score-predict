@@ -27,7 +27,8 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
     - Automatically sets model-specific flags: `enable_categorical=True` for XGBoost, `cat_features=col_names` for CatBoost. LightGBM auto-detects categories from dtype.
     - **Critical benefit**: Satisfies XGBoost's strict validation (all test categories must exist in training) while handling unseen values gracefully.
 - **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed, and all raw predictions are preserved.
-- **Grouped cross-validation support**: Pass `cv_groups` (array/Series of group labels) to use `StratifiedGroupKFold` (classification) or `GroupKFold` (regression). Ensures samples from the same temporal group (e.g., quarter, year) stay together, preventing temporal leakage. Falls back to regular CV when `cv_groups=None`.
+- **Custom CV splitter support**: Pass any scikit-learn–compatible splitter (e.g., `GroupKFold`) via cv_splitter.
+- **Grouped cross-validation support**: Pass `cv_groups` (array/Series of group labels) along with a custom splitter to ensure samples from the same group (e.g., user, time period) stay together. Note: cv_groups requires cv_splitter to be provided.
 - **Flexible scoring and thresholding**: 
     - Custom `scoring_dict` supported (e.g., accuracy, log loss, RMSE).
     - Defaults: ROC AUC for classification, RMSE for regression.
@@ -56,14 +57,16 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `params_dict` | `Optional[Dict[str, dict]]` | `None` | Model-specific hyperparameters. Keys: model names; values: param dicts. |
 | `scoring_dict` | `Optional[Dict[str, Callable]]` | `None` | Metrics for evaluation. Keys: metric names; values: scoring functions (e.g., `roc_auc_score`). Defaults: `{'roc_auc': roc_auc_score}` (classification), `{'rmse': rmse_fn}` (regression). |
 | `decision_threshold` | `float` | `0.5` | Threshold to convert probabilities to class labels (classification only). |
-| `n_splits` | `int` | `5` | Number of cross-validation folds. |
-| `cv_groups` | `Optional[Union[np.ndarray, pd.Series, List]]` | `None` | Group labels for grouped cross-validation. If provided, uses `StratifiedGroupKFold` (classification) instead of `StratifiedKFold` or `GroupKFold` (regression) instead of regular `KFold`. |
+| `n_splits` | `int` | `5` | Number of cross-validation folds. Ignored if cv_splitter is provided. |
 | `random_state` | `Union[int, List[int]]` | `42` | Seed(s) for reproducibility. If a list, CV is repeated for each seed and results are averaged. |
 | `early_stopping_rounds` | `int` | `50` | Early stopping rounds for boosting models (if not overridden in `params_dict`). |
 | `verbose` | `int` | `2` | Logging level: `2` = full per-fold details, `1` = final summary, `0` = silent. |
 | `return_trained` | `bool` | `False` | If True, returns a list of (fold_processor, model) tuples (one per model × fold × seed). |
 | `predict_proba` | `bool` | `True` | For classification: if `True`, return probabilities; if `False`, return binary labels (using `decision_threshold`). Ignored for regression. |
 | `return_raw_test_preds` | `bool` | `False` | Controls test prediction structure:<br>- `False` (default): Average predictions across folds per (model, seed) → matches OOF structure.<br>- `True`: Return raw per-fold predictions → one column per (model, seed, fold). |
+| `cv_splitter` | `Optional[object]` | `None` | Pre-configured CV splitter instance (e.g., `GroupKFold`). If provided, overrides automatic splitter selection and `n_splits`. Must implement `split(X, y, [groups])` method. |
+| `cv_groups` | `Optional[Union[np.ndarray, pd.Series, List]]` | `None` | Group labels for grouped cross-validation. Requires `cv_splitter` to be provided. Passed to `splitter.split()` if the splitter accepts groups. |
+
 ---
 
 ## 🚀 Installation
@@ -182,6 +185,8 @@ This gives you a leakage-free stacking pipeline with proper early stopping and c
       - Raw mode (`return_raw_test_preds=True`): `{model}_seed_{seed}_fold_{fold}`
 * Averaging happens before thresholding: Probabilities are averaged across folds first, then thresholded (when `predict_proba=False`). This preserves probability semantics and avoids averaging binary labels.
 * Always use `.set_output(transform="pandas")` in sklearn pipelines to preserve column names and dtypes.
+* Custom splitters: When `cv_splitter` is provided, it overrides `n_splits`. The splitter is cloned for each seed in `random_state`. Custom splitters must implement a `split(X, y, [groups])` method that yields `(train_idx, val_idx)` tuples. Most scikit-learn splitters are compatible out of the box.
+* cv_groups requirement: `cv_groups` must be provided when using a group-based splitter (e.g., `GroupKFold`). If `cv_groups` is provided without `cv_splitter`, a `ValueError` is raised.
 
 ---
 
