@@ -22,6 +22,7 @@ def cv_score_predict(
     y: Union[pd.Series, np.ndarray],
     X_test: Optional[pd.DataFrame] = None,
     pred_type: PredictionType = None,
+    unbalanced_target: bool = False,
     processor: Optional[Union[BaseEstimator, TransformerMixin]] = None,
     models: Union[List[ModelKey], ModelKey] = ('lgb', 'xgb', 'cb'),
     params_dict: Optional[Dict[str, dict]] = None,
@@ -67,6 +68,9 @@ def cv_score_predict(
         Final test set to predict. If None, no test predictions are produced.
     pred_type : str
         Either 'classification' or 'regression'.
+    unbalanced_target : bool, default False
+        If True, adds scale_pos_weight estimator parameter (calculated per fold).
+        Ignored for regression.
     processor : object or None, optional
         Preprocessing pipeline with `fit_transform` and `transform` methods.
         Applied BEFORE categorical conversion. If None, features pass through unchanged.
@@ -281,6 +285,13 @@ def cv_score_predict(
                         p['enable_categorical'] = True
                     elif m == 'cb':
                         p['cat_features'] = cat_cols
+                
+                # Handle unbalanced target
+                if unbalanced_target and pred_type == 'classification':
+                    pos_weight = y_train.eq(0).sum() / y_train.eq(1).sum()
+                    p['scale_pos_weight'] = pos_weight
+
+                # Update parameters
                 local_params_dict[m] = p
 
             fold_val_preds_list = []

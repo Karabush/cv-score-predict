@@ -27,8 +27,8 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
     - Automatically sets model-specific flags: `enable_categorical=True` for XGBoost, `cat_features=col_names` for CatBoost. LightGBM auto-detects categories from dtype.
     - **Critical benefit**: Satisfies XGBoost's strict validation (all test categories must exist in training) while handling unseen values gracefully.
 - **Repeated CV over seeds**: Accepts a single seed or a list of seeds; CV is repeated for each seed, and all raw predictions are preserved.
-- **Custom CV splitter support**: Pass any scikit-learn–compatible splitter (e.g., `GroupKFold`) via cv_splitter.
-- **Grouped cross-validation support**: Pass `cv_groups` (array/Series of group labels) along with a custom splitter to ensure samples from the same group (e.g., user, time period) stay together. Note: cv_groups requires cv_splitter to be provided.
+- **Custom CV splitter support**: Pass any scikit-learn–compatible splitter (e.g., `GroupKFold`) via `cv_splitter`.
+- **Grouped cross-validation support**: Pass `cv_groups` (array/Series of group labels) along with a custom splitter to ensure samples from the same group (e.g., user, time period) stay together. Note: `cv_groups` requires `cv_splitter` to be provided.
 - **Flexible scoring and thresholding**: 
     - Custom `scoring_dict` supported (e.g., accuracy, log loss, RMSE).
     - Defaults: ROC AUC for classification, RMSE for regression.
@@ -52,6 +52,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `y` | `Union[pd.Series, np.ndarray]` | — | Target values. |
 | `X_test` | `Optional[pd.DataFrame]` | `None` | Test set for final prediction. If `None`, no test predictions are returned. |
 | `pred_type` | `str` | — | Either `'classification'` or `'regression'` (**required**). |
+| `unbalanced_target` | `bool` | `False` | If `True` adds `scale_pos_weight` estimator parameter (calculated per fold). |
 | `processor` | `Optional[object]` | `None` | Preprocessing pipeline with `fit_transform` and `transform` methods. Must return a `pd.DataFrame` (use `set_output(transform='pandas')`). If `None`, features are passed through unchanged. |
 | `models` | `Union[List[str], str]` | `('lgb', 'xgb', 'cb')` | Models to ensemble. Supported: `'lgb'` (LightGBM), `'xgb'` (XGBoost), `'cb'` (CatBoost). |
 | `params_dict` | `Optional[Dict[str, dict]]` | `None` | Model-specific hyperparameters. Keys: model names; values: param dicts. |
