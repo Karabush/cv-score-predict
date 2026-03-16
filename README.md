@@ -53,7 +53,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `X_test` | `Optional[pd.DataFrame]` | `None` | Test set for final prediction. If `None`, no test predictions are returned. |
 | `pred_type` | `str` | — | Either `'classification'` or `'regression'` (**required**). |
 | `unbalanced_target` | `bool` | `False` | If `True` adds `scale_pos_weight` estimator parameter (calculated per fold). |
-| `processor` | `Optional[object]` | `None` | Preprocessing pipeline with `fit_transform` and `transform` methods. Must return a `pd.DataFrame` (use `set_output(transform='pandas')`). If `None`, features are passed through unchanged. |
+| `processor` | `Optional[object]` | `None` | Preprocessing pipeline with `fit_transform` and `transform` methods. Should return a pd.DataFrame (use set_output(transform='pandas')). Categorical encoding is skipped silently if a non-DataFrame is returned. If `None`, features are passed through unchanged. |
 | `models` | `Union[List[str], str]` | `('lgb', 'xgb', 'cb')` | Models to ensemble. Supported: `'lgb'` (LightGBM), `'xgb'` (XGBoost), `'cb'` (CatBoost). |
 | `params_dict` | `Optional[Dict[str, dict]]` | `None` | Model-specific hyperparameters. Keys: model names; values: param dicts. |
 | `scoring_dict` | `Optional[Dict[str, Callable]]` | `None` | Metrics for evaluation. Keys: metric names; values: scoring functions (e.g., `roc_auc_score`). Defaults: `{'roc_auc': roc_auc_score}` (classification), `{'rmse': rmse_fn}` (regression). |
@@ -66,7 +66,7 @@ Designed for **kagglers, ML engineers, and data scientists** who need reliable, 
 | `predict_proba` | `bool` | `True` | For classification: if `True`, return probabilities; if `False`, return binary labels (using `decision_threshold`). Ignored for regression. |
 | `return_raw_test_preds` | `bool` | `False` | Controls test prediction structure:<br>- `False` (default): Average predictions across folds per (model, seed) → matches OOF structure.<br>- `True`: Return raw per-fold predictions → one column per (model, seed, fold). |
 | `cv_splitter` | `Optional[object]` | `None` | Pre-configured CV splitter instance (e.g., `GroupKFold`). If provided, overrides automatic splitter selection and `n_splits`. Must implement `split(X, y, [groups])` method. |
-| `cv_groups` | `Optional[Union[np.ndarray, pd.Series, List]]` | `None` | Group labels for grouped cross-validation. Requires `cv_splitter` to be provided. Passed to `splitter.split()` if the splitter accepts groups. |
+| `cv_groups` | `Optional[Union[np.ndarray, pd.Series]]` | `None` | Group labels for grouped cross-validation. Requires `cv_splitter` to be provided. Passed to `splitter.split()` if the splitter accepts groups. |
 
 ---
 

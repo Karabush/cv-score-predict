@@ -135,7 +135,9 @@ def cv_score_predict(
     trained_pipelines : list of (processor, model) tuples or None
         If return_trained=True, list of (fold_processor, model) for each model/fold/seed.
     """
-    # Input Validation
+    # ------------------------------------------------------------------ #
+    # Input validation
+    # ------------------------------------------------------------------ #
     if pred_type not in ('classification', 'regression'):
         raise ValueError("pred_type must be 'classification' or 'regression'")
 
@@ -169,15 +171,22 @@ def cv_score_predict(
     # Ensure y as pd.Series for consistent indexing with iloc
     y = y if isinstance(y, pd.Series) else pd.Series(y)
 
+    # ------------------------------------------------------------------ #
+    # Output containers
+    # ------------------------------------------------------------------ #
+
     # Initialize OOF: one column per (model, seed) 
     oof_col_names = [f"{m}_seed_{seed}" for seed in random_states for m in models]
     oof_preds_df = pd.DataFrame(index=X.index, columns=oof_col_names, dtype=np.float64)
-    oof_preds_df[:] = np.nan  
 
     # Initialize test preds: Dynamic column creation handled in loop
     test_preds_df = None
     if X_test is not None:
         test_preds_df = pd.DataFrame(index=X_test.index, dtype=np.float64)
+
+    # ------------------------------------------------------------------ #
+    # Defaults
+    # ------------------------------------------------------------------ #
 
     # Default scoring
     if scoring_dict is None:
@@ -215,8 +224,17 @@ def cv_score_predict(
     def _print(msg, level=2):
         if verbose >= level:
             print(msg)
-
-    # Main loop across random states
+    
+    # Helper for scoring (handles proba vs binary dispatch)
+    def _compute_score(metric_name, scoring_fn, y_true, preds, binary):
+        use_proba = pred_type == 'regression' or any(
+            k in metric_name.lower() for k in ('roc', 'auc', 'logloss', 'log_loss')
+        )
+        return scoring_fn(y_true, preds if use_proba else binary)
+    
+    # ------------------------------------------------------------------ #
+    # Main loop
+    # ------------------------------------------------------------------ #
     for seed in random_states:
         _print(f'\n=== Random State {seed} ===', level=2)
         
@@ -233,7 +251,6 @@ def cv_score_predict(
             if hasattr(splitter, 'n_splits') and splitter.n_splits != n_splits:
                 _print(f"Warning: splitter.n_splits ({splitter.n_splits}) differs from function arg n_splits ({n_splits}). Using splitter's value.", level=1)
             
-            split_args = (X, y)
             split_kwargs = {}
             if cv_groups is not None:
                 split_kwargs['groups'] = cv_groups
@@ -251,14 +268,13 @@ def cv_score_predict(
                     shuffle=True, 
                     random_state=seed
                 )
-            split_args = (X, y)
             split_kwargs = {}
 
         # Per-seed storage for reporting 
         seed_model_scores = {m: {name: [] for name in scoring_dict.keys()} for m in models}
         seed_stack_scores = {metric_name: [] for metric_name in scoring_dict.keys()}
         
-        for fold, (train_idx, val_idx) in enumerate(splitter.split(*split_args, **split_kwargs)):
+        for fold, (train_idx, val_idx) in enumerate(splitter.split(X, y, **split_kwargs)):
             _print(f'\nFold {fold + 1}', level=2)
 
             X_train, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
@@ -268,14 +284,14 @@ def cv_score_predict(
             fold_processor = _CatWrapper(copy.deepcopy(base_processor))
 
             # Apply processor to current fold
-            X_train = fold_processor.fit_transform(X_train, y_train)
-            X_val = fold_processor.transform(X_val)
+            X_train_proc = fold_processor.fit_transform(X_train, y_train)
+            X_val_proc   = fold_processor.transform(X_val)
             X_test_proc = fold_processor.transform(X_test) if X_test is not None else None
             
             # Get categorical columns for model params 
             cat_cols = getattr(fold_processor, 'cat_cols_', [])
 
-            # Update model params for categorical handling
+            # Build per-fold params once, outside the model loop
             local_params_dict = {}
             for m in models:
                 p = params_dict[m].copy()
@@ -288,8 +304,8 @@ def cv_score_predict(
                 
                 # Handle unbalanced target
                 if unbalanced_target and pred_type == 'classification':
-                    pos_weight = y_train.eq(0).sum() / y_train.eq(1).sum()
-                    p['scale_pos_weight'] = pos_weight
+                    n_pos = y_train.eq(1).sum()
+                    p['scale_pos_weight'] = (y_train.eq(0).sum() / n_pos) if n_pos > 0 else 1.0
 
                 # Update parameters
                 local_params_dict[m] = p
@@ -303,13 +319,12 @@ def cv_score_predict(
                 if model_name == 'lgb':
                     ModelClass = lgb.LGBMClassifier if pred_type == 'classification' else lgb.LGBMRegressor
                     # Set a high default to allow early stopping to determine optimal rounds
-                    if not p:
-                        p.setdefault('n_estimators', 10000)
+                    p.setdefault('n_estimators', 10000)
                     p.setdefault('verbosity', -1)
                     model = ModelClass(**p)
                     model.fit(
-                        X_train, y_train,
-                        eval_set=[(X_val, y_val)],
+                        X_train_proc, y_train,
+                        eval_set=[(X_val_proc, y_val)],
                         callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)]
                     )
                 elif model_name in ['xgb', 'cb']:
@@ -317,16 +332,13 @@ def cv_score_predict(
                    
                     if model_name == 'xgb': 
                         ModelClass = xgb.XGBClassifier if pred_type == 'classification' else xgb.XGBRegressor
-                        if not p:
-                            p.setdefault('n_estimators', 10000) 
+                        p.setdefault('n_estimators', 10000) 
                     else:
                         ModelClass = cb.CatBoostClassifier if pred_type == 'classification' else cb.CatBoostRegressor
-                        if not p:
-                            p.setdefault('iterations', 10000)
+                        p.setdefault('iterations', 10000)
 
                     model = ModelClass(**p) 
-                    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-
+                    model.fit(X_train_proc, y_train, eval_set=[(X_val_proc, y_val)], verbose=False)
 
                 # Store the (fitted fold_processor, trained fold model) tuple if requested
                 if return_trained:
@@ -336,11 +348,11 @@ def cv_score_predict(
                 if pred_type == 'classification':
                     # Prefer predict_proba; if user requested binary output at top-level,
                     # we still compute probabilities here and convert later if needed
-                    val_preds = model.predict_proba(X_val)[:, 1]
+                    val_preds = model.predict_proba(X_val_proc)[:, 1]
                     test_fold_preds = model.predict_proba(X_test_proc)[:, 1] if X_test_proc is not None else None
                     
                 else:  # regression
-                    val_preds = model.predict(X_val)
+                    val_preds = model.predict(X_val_proc)
                     test_fold_preds = model.predict(X_test_proc) if X_test_proc is not None else None
 
                 # Clip classification probabilities to [0,1] 
@@ -351,8 +363,7 @@ def cv_score_predict(
                 
                 # OOF predictions: accumulate into (model, seed) column
                 oof_col = f"{model_name}_seed_{seed}"
-                val_index_labels = X.iloc[val_idx].index
-                oof_preds_df.loc[val_index_labels, oof_col] = val_preds
+                oof_preds_df.loc[X.index[val_idx], oof_col] = val_preds
 
                 # Test predictions: accumulate into (model, seed, fold) column
                 if X_test is not None:
@@ -363,50 +374,21 @@ def cv_score_predict(
                 fold_val_preds_list.append(val_preds)
 
                 # Score individual model on this fold
-                if pred_type == 'classification':
-                    val_binary = (val_preds >= decision_threshold).astype(int)
-
-                    for metric_name, scoring_fn in scoring_dict.items():
-                        name_l = metric_name.lower()
-
-                        if any(k in name_l for k in ('roc', 'auc', 'logloss', 'log_loss')):
-                            score = scoring_fn(y_val, val_preds)
-                        else:
-                            score = scoring_fn(y_val, val_binary)
-
-                        cv_results['per_model'][model_name][metric_name].append(score)
-                        seed_model_scores[model_name][metric_name].append(score)
-                        _print(f'  {model_name.upper()} {metric_name}: {score:.5f}', level=2)
-                else:
-                    for metric_name, scoring_fn in scoring_dict.items():
-                        score = scoring_fn(y_val, val_preds)
-                        cv_results['per_model'][model_name][metric_name].append(score)
-                        seed_model_scores[model_name][metric_name].append(score)
-                        _print(f'  {model_name.upper()} {metric_name}: {score:.5f}', level=2)
+                val_binary = (val_preds >= decision_threshold).astype(int) if pred_type == 'classification' else None
+                for metric_name, scoring_fn in scoring_dict.items():
+                    score = _compute_score(metric_name, scoring_fn, y_val, val_preds, val_binary)
+                    cv_results['per_model'][model_name][metric_name].append(score)
+                    seed_model_scores[model_name][metric_name].append(score)
+                    _print(f'  {model_name.upper()} {metric_name}: {score:.5f}', level=2)
 
             # Stacked scoring (mean of models on this fold)
             fold_val_preds = np.mean(np.vstack(fold_val_preds_list), axis=0)
-
-            if pred_type == 'classification':
-                fold_val_binary = (fold_val_preds >= decision_threshold).astype(int)
-
-                for metric_name, scoring_fn in scoring_dict.items():
-                    name_l = metric_name.lower()
-
-                    if any(k in name_l for k in ('roc', 'auc', 'logloss', 'log_loss')):
-                        stacked_score = scoring_fn(y_val, fold_val_preds)
-                    else:
-                        stacked_score = scoring_fn(y_val, fold_val_binary)
-
-                    cv_results['stacked'][metric_name].append(stacked_score)
-                    seed_stack_scores[metric_name].append(stacked_score)
-                    _print(f'  Stacked {metric_name}: {stacked_score:.5f}', level=2)
-            else:
-                for metric_name, scoring_fn in scoring_dict.items():
-                    stacked_score = scoring_fn(y_val, fold_val_preds)
-                    cv_results['stacked'][metric_name].append(stacked_score)
-                    seed_stack_scores[metric_name].append(stacked_score)
-                    _print(f'  Stacked {metric_name}: {stacked_score:.5f}', level=2)
+            fold_val_binary = (fold_val_preds >= decision_threshold).astype(int) if pred_type == 'classification' else None
+            for metric_name, scoring_fn in scoring_dict.items():
+                stacked_score = _compute_score(metric_name, scoring_fn, y_val, fold_val_preds, fold_val_binary)
+                cv_results['stacked'][metric_name].append(stacked_score)
+                seed_stack_scores[metric_name].append(stacked_score)
+                _print(f'  Stacked {metric_name}: {stacked_score:.5f}', level=2)
 
         # --- End of folds for this seed ---
         
@@ -414,17 +396,18 @@ def cv_score_predict(
         if verbose >= 2:          
             _print(f'\nSeed {seed} mean scores:', level=2)
             for model_name in models:
-                for metric_name, vals in seed_model_scores[model_name].items():
-                    mean_val = float(np.mean(vals)) if vals else float('nan')
-                    _print(f'  {model_name.upper()} {metric_name}: {mean_val:.5f}', level=2)
+                for metric_name, vals in seed_model_scores[model_name].items(): 
+                    _print(f'  {model_name.upper()} {metric_name}: {float(np.mean(vals)):.5f}', level=2)
 
             # Stacked average scores
-            for metric_name, score in {k: float(np.mean(v)) for k, v in seed_stack_scores.items()}.items():
-                _print(f'  Stacked {metric_name}: {score:.5f}', level=2)
+            for metric_name, vals in seed_stack_scores.items():
+                _print(f'  Stacked {metric_name}: {float(np.mean(vals)):.5f}', level=2)
 
     # --- End of seeds ---
 
+    # ------------------------------------------------------------------ #
     # Final summary
+    # ------------------------------------------------------------------ #
     if verbose >= 1:
         print('\n' + '=' * 30)
         print('=== CV Results Summary ===\n')
@@ -465,10 +448,11 @@ def cv_score_predict(
 class _CatWrapper(BaseEstimator, TransformerMixin):
     """
     Wraps a base processor and ensures robust categorical handling for gradient boosters.
-    
-    After applying `base_processor.fit_transform()`, detects columns with object/string/
-    categorical dtypes and applies OrdinalEncoder with explicit unseen-category handling.    
-    Final output converts encoded integers to pandas 'category' dtype. 
+
+    Overrides `fit_transform` so the base processor runs only **once** on training data,
+    avoiding the double-pass that would occur with sklearn's default implementation
+    (which calls `fit(X).transform(X)`, causing `base_processor.fit_transform` then
+    `base_processor.transform` to both run on the same data).
     
     Attributes
     ----------
@@ -480,8 +464,11 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
     def __init__(self, base_processor):
         self.base_processor = base_processor
 
-    def fit(self, X, y=None):
-        X_proc = self.base_processor.fit_transform(X, y)
+    def fit_transform(self, X, y=None):
+        X_proc = self.base_processor.fit_transform(X, y)  # single pass
+        self.cat_cols_ = []
+        self.oe_ = None
+
         if isinstance(X_proc, pd.DataFrame):
             self.cat_cols_ = [
                 col for col, dtype in X_proc.dtypes.items()
@@ -497,12 +484,15 @@ class _CatWrapper(BaseEstimator, TransformerMixin):
                     encoded_missing_value=-1,
                 ).set_output(transform='pandas')
                 self.oe_.fit(X_proc[self.cat_cols_])
-            else:
-                self.oe_ = None
-        else:
-            self.cat_cols_ = []
-            self.oe_ = None
+                X_proc = X_proc.copy()
+                X_proc[self.cat_cols_] = (
+                    self.oe_.transform(X_proc[self.cat_cols_]).astype('category')
+                )
 
+        return X_proc
+    
+    def fit(self, X, y=None):
+        self.fit_transform(X, y)
         return self
 
     def transform(self, X):
